@@ -11,7 +11,7 @@
 from .common import Extractor, Message
 from .. import text, oauth, util, config, exception
 from ..output import stdout_write
-from ..cache import cache
+from ..cache import cache, memcache
 import urllib.parse
 import binascii
 import hashlib
@@ -28,7 +28,12 @@ class OAuthBase(Extractor):
     def __init__(self, match):
         Extractor.__init__(self, match)
         self.client = None
+
+    def _init(self):
         self.cache = config.get(("extractor", self.category), "cache", True)
+        if self.cache and cache is memcache:
+            self.log.warning("cache file is not writeable")
+            self.cache = False
 
     def oauth_config(self, key, default=None):
         value = config.interpolate(("extractor", self.subcategory), key)
@@ -78,7 +83,7 @@ class OAuthBase(Extractor):
                 browser = None
 
         if browser and browser.open(url):
-            name = getattr(browser, "name", "Browser")
+            name = getattr(browser, "name", None) or "Browser"
             self.log.info("Opening URL in %s:", name.capitalize())
         else:
             self.log.info("Please open this URL in your browser:")
@@ -105,7 +110,7 @@ class OAuthBase(Extractor):
 
         # get a request token
         params = {"oauth_callback": self.redirect_uri}
-        data = self.session.get(request_token_url, params=params).text
+        data = self.request(request_token_url, params=params).text
 
         data = text.parse_query(data)
         self.session.auth.token_secret = data["oauth_token_secret"]
@@ -115,7 +120,7 @@ class OAuthBase(Extractor):
         data = self.open(authorize_url, params)
 
         # exchange the request token for an access token
-        data = self.session.get(access_token_url, params=data).text
+        data = self.request(access_token_url, params=data).text
         data = text.parse_query(data)
         token = data["oauth_token"]
         token_secret = data["oauth_token_secret"]
@@ -134,7 +139,7 @@ class OAuthBase(Extractor):
 
     def _oauth2_authorization_code_grant(
             self, client_id, client_secret, default_id, default_secret,
-            auth_url, token_url, *, scope="read", duration="permanent",
+            auth_url, token_url, scope="read", duration="permanent",
             key="refresh_token", auth=True, cache=None, instance=None):
         """Perform an OAuth2 authorization code grant"""
 
@@ -178,13 +183,14 @@ class OAuthBase(Extractor):
         }
 
         if auth:
-            auth = (client_id, client_secret)
+            auth = util.HTTPBasicAuth(client_id, client_secret)
         else:
             auth = None
             data["client_id"] = client_id
             data["client_secret"] = client_secret
 
-        data = self.session.post(token_url, data=data, auth=auth).json()
+        data = self.request(
+            token_url, method="POST", data=data, auth=auth).json()
 
         # check token response
         if "error" in data:
@@ -241,6 +247,7 @@ class OAuthBase(Extractor):
 class OAuthFlickr(OAuthBase):
     subcategory = "flickr"
     pattern = "oauth:flickr$"
+    example = "oauth:flickr"
     redirect_uri = REDIRECT_URI_HTTPS
 
     def items(self):
@@ -259,6 +266,7 @@ class OAuthFlickr(OAuthBase):
 class OAuthSmugmug(OAuthBase):
     subcategory = "smugmug"
     pattern = "oauth:smugmug$"
+    example = "oauth:smugmug"
 
     def items(self):
         yield Message.Version, 1
@@ -276,6 +284,7 @@ class OAuthSmugmug(OAuthBase):
 class OAuthTumblr(OAuthBase):
     subcategory = "tumblr"
     pattern = "oauth:tumblr$"
+    example = "oauth:tumblr"
 
     def items(self):
         yield Message.Version, 1
@@ -296,6 +305,7 @@ class OAuthTumblr(OAuthBase):
 class OAuthDeviantart(OAuthBase):
     subcategory = "deviantart"
     pattern = "oauth:deviantart$"
+    example = "oauth:deviantart"
     redirect_uri = REDIRECT_URI_HTTPS
 
     def items(self):
@@ -317,6 +327,7 @@ class OAuthDeviantart(OAuthBase):
 class OAuthReddit(OAuthBase):
     subcategory = "reddit"
     pattern = "oauth:reddit$"
+    example = "oauth:reddit"
 
     def items(self):
         yield Message.Version, 1
@@ -338,6 +349,7 @@ class OAuthReddit(OAuthBase):
 class OAuthMastodon(OAuthBase):
     subcategory = "mastodon"
     pattern = "oauth:mastodon:(?:https?://)?([^/?#]+)"
+    example = "oauth:mastodon:mastodon.social"
 
     def __init__(self, match):
         OAuthBase.__init__(self, match)
@@ -347,8 +359,8 @@ class OAuthMastodon(OAuthBase):
         yield Message.Version, 1
         from . import mastodon
 
-        for application in mastodon.INSTANCES.values():
-            if self.instance == application["root"].partition("://")[2]:
+        for _, root, application in mastodon.MastodonExtractor.instances:
+            if self.instance == root.partition("://")[2]:
                 break
         else:
             application = self._register(self.instance)
@@ -365,7 +377,7 @@ class OAuthMastodon(OAuthBase):
             cache=mastodon._access_token_cache,
         )
 
-    @cache(maxage=10*365*24*3600, keyarg=1)
+    @cache(maxage=36500*86400, keyarg=1)
     def _register(self, instance):
         self.log.info("Registering application for '%s'", instance)
 
@@ -375,7 +387,7 @@ class OAuthMastodon(OAuthBase):
             "redirect_uris": self.redirect_uri,
             "scopes": "read",
         }
-        data = self.session.post(url, data=data).json()
+        data = self.request(url, method="POST", data=data).json()
 
         if "client_id" not in data or "client_secret" not in data:
             raise exception.StopExtraction(
@@ -395,6 +407,7 @@ class OAuthMastodon(OAuthBase):
 class OAuthPixiv(OAuthBase):
     subcategory = "pixiv"
     pattern = "oauth:pixiv$"
+    example = "oauth:pixiv"
 
     def items(self):
         yield Message.Version, 1
@@ -411,7 +424,7 @@ class OAuthPixiv(OAuthBase):
             "code_challenge_method": "S256",
             "client": "pixiv-android",
         }
-        code = self.open(url, params, self._input)
+        code = self.open(url, params, self._input_code)
 
         url = "https://oauth.secure.pixiv.net/auth/token"
         headers = {
@@ -429,7 +442,8 @@ class OAuthPixiv(OAuthBase):
             "redirect_uri"  : "https://app-api.pixiv.net"
                               "/web/v1/users/auth/pixiv/callback",
         }
-        data = self.session.post(url, headers=headers, data=data).json()
+        data = self.request(
+            url, method="POST", headers=headers, data=data).json()
 
         if "error" in data:
             stdout_write("\n{}\n".format(data))
@@ -445,7 +459,7 @@ class OAuthPixiv(OAuthBase):
 
         stdout_write(self._generate_message(("refresh-token",), (token,)))
 
-    def _input(self):
+    def _input_code(self):
         stdout_write("""\
 1) Open your browser's Developer Tools (F12) and switch to the Network tab
 2) Login
@@ -457,5 +471,5 @@ class OAuthPixiv(OAuthBase):
   like the entire URL or several query parameters.
 
 """)
-        code = input("code: ")
+        code = self.input("code: ")
         return code.rpartition("=")[2].strip()

@@ -18,7 +18,7 @@ class PlurkExtractor(Extractor):
     """Base class for plurk extractors"""
     category = "plurk"
     root = "https://www.plurk.com"
-    request_interval = 1.0
+    request_interval = (0.5, 1.5)
 
     def items(self):
         urls = self._urls_ex if self.config("comments", False) else self._urls
@@ -71,10 +71,7 @@ class PlurkTimelineExtractor(PlurkExtractor):
     """Extractor for URLs from all posts in a Plurk timeline"""
     subcategory = "timeline"
     pattern = r"(?:https?://)?(?:www\.)?plurk\.com/(?!p/)(\w+)/?(?:$|[?#])"
-    test = ("https://www.plurk.com/plurkapi", {
-        "pattern": r"https?://.+",
-        "count": ">= 23"
-    })
+    example = "https://www.plurk.com/USER"
 
     def __init__(self, match):
         PlurkExtractor.__init__(self, match)
@@ -105,27 +102,18 @@ class PlurkPostExtractor(PlurkExtractor):
     """Extractor for URLs from a Plurk post"""
     subcategory = "post"
     pattern = r"(?:https?://)?(?:www\.)?plurk\.com/p/(\w+)"
-    test = (
-        ("https://www.plurk.com/p/i701j1", {
-            "url": "2115f208564591b8748525c2807a84596aaaaa5f",
-            "count": 3,
-        }),
-        ("https://www.plurk.com/p/i701j1", {
-            "options": (("comments", True),),
-            "count": ">= 210",
-        }),
-    )
-
-    def __init__(self, match):
-        PlurkExtractor.__init__(self, match)
-        self.plurk_id = match.group(1)
+    example = "https://www.plurk.com/p/12345"
 
     def plurks(self):
-        url = "{}/p/{}".format(self.root, self.plurk_id)
+        url = "{}/p/{}".format(self.root, self.groups[0])
         page = self.request(url).text
-        user, pos = text.extract(page, " GLOBAL = ", "\n")
-        data, pos = text.extract(page, "plurk = ", ";\n", pos)
+        user, pos = text.extract(page, " GLOBAL=", "\n")
+        data, pos = text.extract(page, "plurk =", ";\n", pos)
 
         data = self._load(data)
-        data["user"] = self._load(user)["page_user"]
+        try:
+            data["user"] = self._load(user)["page_user"]
+        except Exception:
+            self.log.warning("%s: Failed to extract 'user' data",
+                             self.groups[0])
         return (data,)

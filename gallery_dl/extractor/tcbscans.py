@@ -4,46 +4,23 @@
 # it under the terms of the GNU General Public License version 2 as
 # published by the Free Software Foundation.
 
-"""Extractors for https://onepiecechapters.com/"""
+"""Extractors for https://tcbscans.me/"""
 
 from .common import ChapterExtractor, MangaExtractor
 from .. import text
 
+BASE_PATTERN = (r"(?:https?://)?(?:tcb(?:-backup\.bihar-mirchi|scans)"
+                r"|onepiecechapters)\.(?:com|me)")
+
 
 class TcbscansChapterExtractor(ChapterExtractor):
     category = "tcbscans"
-    pattern = (r"(?:https?://)?onepiecechapters\.com"
-               r"(/chapters/\d+/[^/?#]+)")
-    root = "https://onepiecechapters.com"
-    test = (
-        (("https://onepiecechapters.com"
-          "/chapters/4708/chainsaw-man-chapter-108"), {
-            "pattern": (r"https://cdn\.[^/]+"
-                        r"/(file|attachments/[^/]+)/[^/]+/[^.]+\.\w+"),
-            "count"  : 17,
-            "keyword": {
-                "manga": "Chainsaw Man",
-                "chapter": 108,
-                "chapter_minor": "",
-                "lang": "en",
-                "language": "English",
-            },
-        }),
-        ("https://onepiecechapters.com/chapters/4716/one-piece-chapter-1065", {
-            "pattern": (r"https://cdn\.[^/]+"
-                        r"/(file|attachments/[^/]+)/[^/]+/[^.]+\.\w+"),
-            "count"  : 18,
-            "keyword": {
-                "manga": "One Piece",
-                "chapter": 1065,
-                "chapter_minor": "",
-                "lang": "en",
-                "language": "English",
-            },
-        }),
-        (("https://onepiecechapters.com/"
-          "chapters/44/ace-novel-manga-adaptation-chapter-1")),
-    )
+    pattern = BASE_PATTERN + r"(/chapters/\d+/[^/?#]+)"
+    example = "https://tcbscans.me/chapters/12345/MANGA-chapter-123"
+
+    def __init__(self, match):
+        self.root = text.root_from_url(match.group(0))
+        ChapterExtractor.__init__(self, match)
 
     def images(self, page):
         return [
@@ -57,7 +34,7 @@ class TcbscansChapterExtractor(ChapterExtractor):
             page, 'font-bold mt-8">', "</h1>").rpartition(" - Chapter ")
         chapter, sep, minor = chapter.partition(".")
         return {
-            "manga": text.unescape(manga),
+            "manga": text.unescape(manga).strip(),
             "chapter": text.parse_int(chapter),
             "chapter_minor": sep + minor,
             "lang": "en", "language": "English",
@@ -67,22 +44,12 @@ class TcbscansChapterExtractor(ChapterExtractor):
 class TcbscansMangaExtractor(MangaExtractor):
     category = "tcbscans"
     chapterclass = TcbscansChapterExtractor
-    pattern = (r"(?:https?://)?onepiecechapters\.com"
-               r"(/mangas/\d+/[^/?#]+)")
-    root = "https://onepiecechapters.com"
-    test = (
-        ("https://onepiecechapters.com/mangas/13/chainsaw-man", {
-            "pattern": TcbscansChapterExtractor.pattern,
-            "range"  : "1-50",
-            "count"  : 50,
-        }),
-        ("https://onepiecechapters.com/mangas/4/jujutsu-kaisen", {
-            "pattern": TcbscansChapterExtractor.pattern,
-            "range"  : "1-50",
-            "count"  : 50,
-        }),
-        ("https://onepiecechapters.com/mangas/15/hunter-x-hunter"),
-    )
+    pattern = BASE_PATTERN + r"(/mangas/\d+/[^/?#]+)"
+    example = "https://tcbscans.me/mangas/123/MANGA"
+
+    def __init__(self, match):
+        self.root = text.root_from_url(match.group(0))
+        MangaExtractor.__init__(self, match)
 
     def chapters(self, page):
         data = {

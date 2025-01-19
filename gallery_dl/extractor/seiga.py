@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2016-2022 Mike Fährmann
+# Copyright 2016-2023 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -10,13 +10,15 @@
 
 from .common import Extractor, Message
 from .. import text, util, exception
+from ..cache import cache
 
 
 class SeigaExtractor(Extractor):
     """Base class for seiga extractors"""
     category = "seiga"
     archive_fmt = "{image_id}"
-    cookiedomain = ".nicovideo.jp"
+    cookies_domain = ".nicovideo.jp"
+    cookies_names = ("user_session",)
     root = "https://seiga.nicovideo.jp"
 
     def __init__(self, match):
@@ -24,8 +26,7 @@ class SeigaExtractor(Extractor):
         self.start_image = 0
 
     def items(self):
-        if not self._check_cookies(("user_session",)):
-            raise exception.StopExtraction("'user_session' cookie required")
+        self.login()
 
         images = iter(self.get_images())
         data = next(images)
@@ -50,6 +51,59 @@ class SeigaExtractor(Extractor):
                 "HTTP redirect to login page (%s)", location.partition("?")[0])
         return location.replace("/o/", "/priv/", 1)
 
+    def login(self):
+        if self.cookies_check(self.cookies_names):
+            return
+
+        username, password = self._get_auth_info()
+        if username:
+            return self.cookies_update(self._login_impl(username, password))
+
+        raise exception.AuthorizationError(
+            "username & password or 'user_session' cookie required")
+
+    @cache(maxage=365*86400, keyarg=1)
+    def _login_impl(self, username, password):
+        self.log.info("Logging in as %s", username)
+
+        root = "https://account.nicovideo.jp"
+        response = self.request(root + "/login?site=seiga")
+        page = response.text
+
+        data = {
+            "mail_tel": username,
+            "password": password,
+        }
+        url = root + text.unescape(text.extr(page, '<form action="', '"'))
+        response = self.request(url, method="POST", data=data)
+
+        if "message=cant_login" in response.url:
+            raise exception.AuthenticationError()
+
+        if "/mfa" in response.url:
+            page = response.text
+            email = text.extr(page, 'class="userAccount">', "<")
+            code = self.input("Email Confirmation Code ({}): ".format(email))
+
+            data = {
+                "otp": code,
+                "loginBtn": "Login",
+                "device_name": "gdl",
+            }
+            url = root + text.unescape(text.extr(page, '<form action="', '"'))
+            response = self.request(url, method="POST", data=data)
+
+            if not response.history and \
+                    b"Confirmation code is incorrect" in response.content:
+                raise exception.AuthenticationError(
+                    "Incorrect Confirmation Code")
+
+        return {
+            cookie.name: cookie.value
+            for cookie in self.cookies
+            if cookie.expires and cookie.domain == self.cookies_domain
+        }
+
 
 class SeigaUserExtractor(SeigaExtractor):
     """Extractor for images of a user from seiga.nicovideo.jp"""
@@ -58,32 +112,7 @@ class SeigaUserExtractor(SeigaExtractor):
     filename_fmt = "{category}_{user[id]}_{image_id}.{extension}"
     pattern = (r"(?:https?://)?(?:www\.|(?:sp\.)?seiga\.)?nicovideo\.jp/"
                r"user/illust/(\d+)(?:\?(?:[^&]+&)*sort=([^&#]+))?")
-    test = (
-        ("https://seiga.nicovideo.jp/user/illust/39537793", {
-            "pattern": r"https://lohas\.nicoseiga\.jp/priv/[0-9a-f]+/\d+/\d+",
-            "count": ">= 4",
-            "keyword": {
-                "user": {
-                    "id": 39537793,
-                    "message": str,
-                    "name": str,
-                },
-                "clips": int,
-                "comments": int,
-                "count": int,
-                "extension": None,
-                "image_id": int,
-                "title": str,
-                "views": int,
-            },
-        }),
-        ("https://seiga.nicovideo.jp/user/illust/79433", {
-            "exception": exception.NotFoundError,
-        }),
-        ("https://seiga.nicovideo.jp/user/illust/39537793"
-         "?sort=image_view&target=illust_all"),
-        ("https://sp.seiga.nicovideo.jp/user/illust/39537793"),
-    )
+    example = "https://seiga.nicovideo.jp/user/illust/12345"
 
     def __init__(self, match):
         SeigaExtractor.__init__(self, match)
@@ -156,22 +185,7 @@ class SeigaImageExtractor(SeigaExtractor):
                r"(?:seiga\.|www\.)?nicovideo\.jp/(?:seiga/im|image/source/)"
                r"|sp\.seiga\.nicovideo\.jp/seiga/#!/im"
                r"|lohas\.nicoseiga\.jp/(?:thumb|(?:priv|o)/[^/]+/\d+)/)(\d+)")
-    test = (
-        ("https://seiga.nicovideo.jp/seiga/im5977527", {
-            "keyword": "c8339781da260f7fc44894ad9ada016f53e3b12a",
-            "content": "d9202292012178374d57fb0126f6124387265297",
-        }),
-        ("https://seiga.nicovideo.jp/seiga/im123", {
-            "exception": exception.NotFoundError,
-        }),
-        ("https://seiga.nicovideo.jp/image/source/5977527"),
-        ("https://sp.seiga.nicovideo.jp/seiga/#!/im5977527"),
-        ("https://lohas.nicoseiga.jp/thumb/5977527i"),
-        ("https://lohas.nicoseiga.jp/priv"
-         "/759a4ef1c639106ba4d665ee6333832e647d0e4e/1549727594/5977527"),
-        ("https://lohas.nicoseiga.jp/o"
-         "/759a4ef1c639106ba4d665ee6333832e647d0e4e/1549727594/5977527"),
-    )
+    example = "https://seiga.nicovideo.jp/seiga/im12345"
 
     def __init__(self, match):
         SeigaExtractor.__init__(self, match)
@@ -182,6 +196,9 @@ class SeigaImageExtractor(SeigaExtractor):
         return num
 
     def get_images(self):
+        self.cookies.set(
+            "skip_fetish_warning", "1", domain="seiga.nicovideo.jp")
+
         url = "{}/seiga/im{}".format(self.root, self.image_id)
         page = self.request(url, notfound="image").text
 

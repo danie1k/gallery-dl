@@ -4,72 +4,62 @@
 # it under the terms of the GNU General Public License version 2 as
 # published by the Free Software Foundation.
 
-"""Extractors for https://hentai-cosplays.com/
-(also works for hentai-img.com and porn-images-xxx.com)"""
+"""Extractors for https://hentai-cosplay-xxx.com/
+(also works for hentai-img-xxx.com and porn-image.com)"""
 
-from .common import GalleryExtractor
+from .common import BaseExtractor, GalleryExtractor
 from .. import text
 
 
-class HentaicosplaysGalleryExtractor(GalleryExtractor):
+class HentaicosplaysExtractor(BaseExtractor):
+    basecategory = "hentaicosplays"
+
+
+BASE_PATTERN = HentaicosplaysExtractor.update({
+    "hentaicosplay": {
+        "root": "https://hentai-cosplay-xxx.com",
+        "pattern": r"(?:\w\w\.)?hentai-cosplays?(?:-xxx)?\.com",
+    },
+    "hentaiimg": {
+        "root": "https://hentai-img-xxx.com",
+        "pattern": r"(?:\w\w\.)?hentai-img(?:-xxx)?\.com",
+    },
+    "pornimage": {
+        "root": "https://porn-image.com",
+        "pattern": r"(?:\w\w\.)?porn-images?(?:-xxx)?\.com",
+    },
+})
+
+
+class HentaicosplaysGalleryExtractor(
+        HentaicosplaysExtractor, GalleryExtractor):
     """Extractor for image galleries from
-    hentai-cosplays.com, hentai-img.com, and porn-images-xxx.com"""
-    category = "hentaicosplays"
+    hentai-cosplay-xxx.com, hentai-img-xxx.com, and porn-image.com"""
     directory_fmt = ("{site}", "{title}")
     filename_fmt = "{filename}.{extension}"
     archive_fmt = "{title}_{filename}"
-    pattern = r"((?:https?://)?(?:\w{2}\.)?" \
-              r"(hentai-cosplays|hentai-img|porn-images-xxx)\.com)/" \
-              r"(?:image|story)/([\w-]+)"
-    test = (
-        ("https://hentai-cosplays.com/image/---devilism--tide-kurihara-/", {
-            "pattern": r"https://static\d?.hentai-cosplays.com/upload/"
-                       r"\d+/\d+/\d+/\d+.jpg$",
-            "keyword": {
-                "count": 18,
-                "site": "hentai-cosplays",
-                "slug": "---devilism--tide-kurihara-",
-                "title": "艦 こ れ-devilism の tide Kurihara 憂",
-            },
-        }),
-        ("https://fr.porn-images-xxx.com/image/enako-enako-24/", {
-            "pattern": r"https://static\d?.porn-images-xxx.com/upload/"
-                       r"\d+/\d+/\d+/\d+.jpg$",
-            "keyword": {
-                "count": 11,
-                "site": "porn-images-xxx",
-                "title": str,
-            },
-        }),
-        ("https://ja.hentai-img.com/image/hollow-cora-502/", {
-            "pattern": r"https://static\d?.hentai-img.com/upload/"
-                       r"\d+/\d+/\d+/\d+.jpg$",
-            "keyword": {
-                "count": 2,
-                "site": "hentai-img",
-                "title": str,
-            },
-        }),
-    )
+    pattern = BASE_PATTERN + r"/(?:image|story)/([\w-]+)"
+    example = "https://hentai-cosplay-xxx.com/image/TITLE/"
 
     def __init__(self, match):
-        root, self.site, self.slug = match.groups()
-        self.root = text.ensure_http_scheme(root)
-        url = "{}/story/{}/".format(self.root, self.slug)
-        GalleryExtractor.__init__(self, match, url)
-        self.session.headers["Referer"] = url
+        BaseExtractor.__init__(self, match)
+        self.slug = self.groups[-1]
+        self.gallery_url = "{}/story/{}/".format(self.root, self.slug)
+
+    def _init(self):
+        self.session.headers["Referer"] = self.gallery_url
 
     def metadata(self, page):
         title = text.extr(page, "<title>", "</title>")
         return {
             "title": text.unescape(title.rpartition(" Story Viewer - ")[0]),
             "slug" : self.slug,
-            "site" : self.site,
+            "site" : self.root.partition("://")[2].rpartition(".")[0],
         }
 
     def images(self, page):
         return [
-            (url, None)
+            (url.replace("http:", "https:", 1), None)
             for url in text.extract_iter(
                 page, '<amp-img class="auto-style" src="', '"')
         ]

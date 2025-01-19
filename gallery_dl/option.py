@@ -10,6 +10,7 @@
 
 import argparse
 import logging
+import os.path
 import sys
 from . import job, util, version
 
@@ -44,19 +45,155 @@ class DeprecatedConfigConstAction(argparse.Action):
         namespace.options.append(((), self.dest, self.const))
 
 
-class ParseAction(argparse.Action):
-    """Parse <key>=<value> options and set them as config values"""
+class ConfigParseAction(argparse.Action):
+    """Parse KEY=VALUE config options"""
     def __call__(self, parser, namespace, values, option_string=None):
         key, value = _parse_option(values)
         key = key.split(".")  # splitting an empty string becomes [""]
         namespace.options.append((key[:-1], key[-1], value))
 
 
-class OptionAction(argparse.Action):
-    """Parse <key>=<value> options for """
+class PPParseAction(argparse.Action):
+    """Parse KEY=VALUE post processor options"""
     def __call__(self, parser, namespace, values, option_string=None):
         key, value = _parse_option(values)
         namespace.options_pp[key] = value
+
+
+class InputfileAction(argparse.Action):
+    """Collect input files"""
+    def __call__(self, parser, namespace, value, option_string=None):
+        namespace.input_files.append((value, self.const))
+
+
+class MtimeAction(argparse.Action):
+    """Configure mtime post processors"""
+    def __call__(self, parser, namespace, value, option_string=None):
+        namespace.postprocessors.append({
+            "name": "mtime",
+            "value": "{" + (self.const or value) + "}",
+        })
+
+
+class RenameAction(argparse.Action):
+    """Configure rename post processors"""
+    def __call__(self, parser, namespace, value, option_string=None):
+        if self.const:
+            namespace.postprocessors.append({
+                "name": "rename",
+                "to"  : value,
+            })
+        else:
+            namespace.postprocessors.append({
+                "name": "rename",
+                "from": value,
+            })
+
+
+class UgoiraAction(argparse.Action):
+    """Configure ugoira post processors"""
+    def __call__(self, parser, namespace, value, option_string=None):
+        if self.const:
+            value = self.const
+        else:
+            value = value.strip().lower()
+
+        if value in ("webm", "vp9"):
+            pp = {
+                "extension"        : "webm",
+                "ffmpeg-args"      : ("-c:v", "libvpx-vp9",
+                                      "-crf", "12",
+                                      "-b:v", "0", "-an"),
+            }
+        elif value == "vp9-lossless":
+            pp = {
+                "extension"        : "webm",
+                "ffmpeg-args"      : ("-c:v", "libvpx-vp9",
+                                      "-lossless", "1",
+                                      "-pix_fmt", "yuv420p", "-an"),
+            }
+        elif value == "vp8":
+            pp = {
+                "extension"        : "webm",
+                "ffmpeg-args"      : ("-c:v", "libvpx",
+                                      "-crf", "4",
+                                      "-b:v", "5000k", "-an"),
+            }
+        elif value == "mp4":
+            pp = {
+                "extension"        : "mp4",
+                "ffmpeg-args"      : ("-c:v", "libx264", "-an", "-b:v", "5M"),
+                "libx264-prevent-odd": True,
+            }
+        elif value == "gif":
+            pp = {
+                "extension"        : "gif",
+                "ffmpeg-args"      : ("-filter_complex", "[0:v] split [a][b];"
+                                      "[a] palettegen [p];[b][p] paletteuse"),
+                "repeat-last-frame": False,
+            }
+        elif value == "mkv" or value == "copy":
+            pp = {
+                "extension"        : "mkv",
+                "ffmpeg-args"      : ("-c:v", "copy"),
+                "repeat-last-frame": False,
+            }
+        elif value == "zip" or value == "archive":
+            pp = {
+                "mode"             : "archive",
+            }
+            namespace.options.append(((), "ugoira", "original"))
+        else:
+            parser.error("Unsupported Ugoira format '{}'".format(value))
+
+        pp["name"] = "ugoira"
+        pp["whitelist"] = ("pixiv", "danbooru")
+
+        namespace.options.append((("extractor",), "ugoira", True))
+        namespace.postprocessors.append(pp)
+
+
+class PrintAction(argparse.Action):
+    def __call__(self, parser, namespace, value, option_string=None):
+        if self.const:
+            filename = self.const
+            base = None
+            mode = "w"
+        else:
+            value, path = value
+            base, filename = os.path.split(path)
+            mode = "a"
+
+        event, sep, format_string = value.partition(":")
+        if not sep:
+            format_string = event
+            event = ("prepare",)
+        else:
+            event = event.strip().lower()
+            if event not in {"init", "file", "after", "skip", "error",
+                             "prepare", "prepare-after", "post", "post-after",
+                             "finalize", "finalize-success", "finalize-error"}:
+                format_string = value
+                event = ("prepare",)
+
+        if not format_string:
+            return
+
+        if "{" not in format_string and \
+                " " not in format_string and \
+                format_string[0] != "\f":
+            format_string = "{" + format_string + "}"
+        if format_string[-1] != "\n":
+            format_string += "\n"
+
+        namespace.postprocessors.append({
+            "name"          : "metadata",
+            "event"         : event,
+            "filename"      : filename,
+            "base-directory": base or ".",
+            "content-format": format_string,
+            "open"          : mode,
+        })
 
 
 class Formatter(argparse.HelpFormatter):
@@ -101,12 +238,6 @@ def build_parser():
         help="Print program version and exit",
     )
     general.add_argument(
-        "-i", "--input-file",
-        dest="inputfiles", metavar="FILE", action="append",
-        help=("Download URLs found in FILE ('-' for stdin). "
-              "More than one --input-file can be specified"),
-    )
-    general.add_argument(
         "-f", "--filename",
         dest="filename", metavar="FORMAT",
         help=("Filename format string for downloaded files "
@@ -128,16 +259,6 @@ def build_parser():
         help="Load external extractors from PATH",
     )
     general.add_argument(
-        "--proxy",
-        dest="proxy", metavar="URL", action=ConfigAction,
-        help="Use the specified proxy",
-    )
-    general.add_argument(
-        "--source-address",
-        dest="source-address", metavar="IP", action=ConfigAction,
-        help="Client-side IP address to bind to",
-    )
-    general.add_argument(
         "--user-agent",
         dest="user-agent", metavar="UA", action=ConfigAction,
         help="User-Agent request header",
@@ -148,19 +269,61 @@ def build_parser():
         help="Delete cached login sessions, cookies, etc. for MODULE "
              "(ALL to delete everything)",
     )
-    general.add_argument(
-        "--cookies",
-        dest="cookies", metavar="FILE", action=ConfigAction,
-        help="File to load additional cookies from",
+
+    update = parser.add_argument_group("Update Options")
+    if util.EXECUTABLE:
+        update.add_argument(
+            "-U", "--update",
+            dest="update", action="store_const", const="latest",
+            help="Update to the latest version",
+        )
+        update.add_argument(
+            "--update-to",
+            dest="update", metavar="CHANNEL[@TAG]",
+            help=("Switch to a dfferent release channel (stable or dev) "
+                  "or upgrade/downgrade to a specific version"),
+        )
+        update.add_argument(
+            "--update-check",
+            dest="update", action="store_const", const="check",
+            help="Check if a newer version is available",
+        )
+    else:
+        update.add_argument(
+            "-U", "--update-check",
+            dest="update", action="store_const", const="check",
+            help="Check if a newer version is available",
+        )
+
+    input = parser.add_argument_group("Input Options")
+    input.add_argument(
+        "urls",
+        metavar="URL", nargs="*",
+        help=argparse.SUPPRESS,
     )
-    general.add_argument(
-        "--cookies-from-browser",
-        dest="cookies_from_browser",
-        metavar="BROWSER[+KEYRING][:PROFILE][::CONTAINER]",
-        help=("Name of the browser to load cookies from, "
-              "with optional keyring name prefixed with '+', "
-              "profile prefixed with ':', and "
-              "container prefixed with '::' ('none' for no container)"),
+    input.add_argument(
+        "-i", "--input-file",
+        dest="input_files", metavar="FILE", action=InputfileAction, const=None,
+        default=[],
+        help=("Download URLs found in FILE ('-' for stdin). "
+              "More than one --input-file can be specified"),
+    )
+    input.add_argument(
+        "-I", "--input-file-comment",
+        dest="input_files", metavar="FILE", action=InputfileAction, const="c",
+        help=("Download URLs found in FILE. "
+              "Comment them out after they were downloaded successfully."),
+    )
+    input.add_argument(
+        "-x", "--input-file-delete",
+        dest="input_files", metavar="FILE", action=InputfileAction, const="d",
+        help=("Download URLs found in FILE. "
+              "Delete them after they were downloaded successfully."),
+    )
+    input.add_argument(
+        "--no-input",
+        dest="input", nargs=0, action=ConfigConstAction, const=False,
+        help="Do not prompt for passwords/tokens",
     )
 
     output = parser.add_argument_group("Output Options")
@@ -169,6 +332,12 @@ def build_parser():
         dest="loglevel", default=logging.INFO,
         action="store_const", const=logging.ERROR,
         help="Activate quiet mode",
+    )
+    output.add_argument(
+        "-w", "--warning",
+        dest="loglevel",
+        action="store_const", const=logging.WARNING,
+        help="Print only warnings and errors",
     )
     output.add_argument(
         "-v", "--verbose",
@@ -188,8 +357,13 @@ def build_parser():
     )
     output.add_argument(
         "-j", "--dump-json",
-        dest="jobtype", action="store_const", const=job.DataJob,
+        dest="dump_json", action="count",
         help="Print JSON information",
+    )
+    output.add_argument(
+        "-J", "--resolve-json",
+        dest="dump_json", action="store_const", const=128,
+        help="Print JSON information; resolve intermediary URLs",
     )
     output.add_argument(
         "-s", "--simulate",
@@ -208,13 +382,31 @@ def build_parser():
               "for the given URLs"),
     )
     output.add_argument(
+        "-e", "--error-file",
+        dest="errorfile", metavar="FILE", action=ConfigAction,
+        help="Add input URLs which returned an error to FILE",
+    )
+    output.add_argument(
+        "-N", "--print",
+        dest="postprocessors", metavar="[EVENT:]FORMAT",
+        action=PrintAction, const="-", default=[],
+        help=("Write FORMAT during EVENT (default 'prepare') to standard "
+              "output. Examples: 'id' or 'post:{md5[:8]}'"),
+    )
+    output.add_argument(
+        "--print-to-file",
+        dest="postprocessors", metavar="[EVENT:]FORMAT FILE",
+        action=PrintAction, nargs=2,
+        help="Append FORMAT during EVENT to FILE",
+    )
+    output.add_argument(
         "--list-modules",
         dest="list_modules", action="store_true",
         help="Print a list of available extractor modules",
     )
     output.add_argument(
         "--list-extractors",
-        dest="list_extractors", action="store_true",
+        dest="list_extractors", metavar="[CATEGORIES]", nargs="*",
         help=("Print a list of extractor classes "
               "with description, (sub)category and example URL"),
     )
@@ -235,6 +427,55 @@ def build_parser():
         help=("Write downloaded intermediary pages to files "
               "in the current directory to debug problems"),
     )
+    output.add_argument(
+        "--print-traffic",
+        dest="print_traffic", action="store_true",
+        help="Display sent and read HTTP traffic",
+    )
+    output.add_argument(
+        "--no-colors",
+        dest="colors", action="store_false",
+        help="Do not emit ANSI color codes in output",
+    )
+
+    networking = parser.add_argument_group("Networking Options")
+    networking.add_argument(
+        "-R", "--retries",
+        dest="retries", metavar="N", type=int, action=ConfigAction,
+        help=("Maximum number of retries for failed HTTP requests "
+              "or -1 for infinite retries (default: 4)"),
+    )
+    networking.add_argument(
+        "--http-timeout",
+        dest="timeout", metavar="SECONDS", type=float, action=ConfigAction,
+        help="Timeout for HTTP connections (default: 30.0)",
+    )
+    networking.add_argument(
+        "--proxy",
+        dest="proxy", metavar="URL", action=ConfigAction,
+        help="Use the specified proxy",
+    )
+    networking.add_argument(
+        "--source-address",
+        dest="source-address", metavar="IP", action=ConfigAction,
+        help="Client-side IP address to bind to",
+    )
+    networking.add_argument(
+        "-4", "--force-ipv4",
+        dest="source-address", nargs=0, action=ConfigConstAction,
+        const="0.0.0.0",
+        help="Make all connections via IPv4",
+    )
+    networking.add_argument(
+        "-6", "--force-ipv6",
+        dest="source-address", nargs=0, action=ConfigConstAction, const="::",
+        help="Make all connections via IPv6",
+    )
+    networking.add_argument(
+        "--no-check-certificate",
+        dest="verify", nargs=0, action=ConfigConstAction, const=False,
+        help="Disable HTTPS certificate validation",
+    )
 
     downloader = parser.add_argument_group("Downloader Options")
     downloader.add_argument(
@@ -243,15 +484,9 @@ def build_parser():
         help="Maximum download rate (e.g. 500k or 2.5M)",
     )
     downloader.add_argument(
-        "-R", "--retries",
-        dest="retries", metavar="N", type=int, action=ConfigAction,
-        help=("Maximum number of retries for failed HTTP requests "
-              "or -1 for infinite retries (default: 4)"),
-    )
-    downloader.add_argument(
-        "--http-timeout",
-        dest="timeout", metavar="SECONDS", type=float, action=ConfigAction,
-        help="Timeout for HTTP connections (default: 30.0)",
+        "--chunk-size",
+        dest="chunk-size", metavar="SIZE", action=ConfigAction,
+        help="Size of in-memory data chunks (default: 32k)",
     )
     downloader.add_argument(
         "--sleep",
@@ -271,21 +506,6 @@ def build_parser():
         dest="sleep-extractor", metavar="SECONDS", action=ConfigAction,
         help=("Number of seconds to wait before starting data extraction "
               "for an input URL"),
-    )
-    downloader.add_argument(
-        "--filesize-min",
-        dest="filesize-min", metavar="SIZE", action=ConfigAction,
-        help="Do not download files smaller than SIZE (e.g. 500k or 2.5M)",
-    )
-    downloader.add_argument(
-        "--filesize-max",
-        dest="filesize-max", metavar="SIZE", action=ConfigAction,
-        help="Do not download files larger than SIZE (e.g. 500k or 2.5M)",
-    )
-    downloader.add_argument(
-        "--chunk-size",
-        dest="chunk-size", metavar="SIZE", action=ConfigAction,
-        help="Size of in-memory data chunks (default: 32k)",
     )
     downloader.add_argument(
         "--no-part",
@@ -308,21 +528,12 @@ def build_parser():
         dest="download", nargs=0, action=ConfigConstAction, const=False,
         help=("Do not download any files")
     )
-    downloader.add_argument(
-        "--no-postprocessors",
-        dest="postprocess", nargs=0, action=ConfigConstAction, const=False,
-        help=("Do not run any post processors")
-    )
-    downloader.add_argument(
-        "--no-check-certificate",
-        dest="verify", nargs=0, action=ConfigConstAction, const=False,
-        help="Disable HTTPS certificate validation",
-    )
 
     configuration = parser.add_argument_group("Configuration Options")
     configuration.add_argument(
         "-o", "--option",
-        dest="options", metavar="KEY=VALUE", action=ParseAction, default=[],
+        dest="options", metavar="KEY=VALUE",
+        action=ConfigParseAction, default=[],
         help=("Additional options. "
               "Example: -o browser=firefox")   ,
     )
@@ -343,8 +554,18 @@ def build_parser():
     )
     configuration.add_argument(
         "--config-create",
-        dest="config_init", action="store_true",
+        dest="config", action="store_const", const="init",
         help="Create a basic configuration file",
+    )
+    configuration.add_argument(
+        "--config-status",
+        dest="config", action="store_const", const="status",
+        help="Show configuration file status",
+    )
+    configuration.add_argument(
+        "--config-open",
+        dest="config", action="store_const", const="open",
+        help="Open configuration file in external application",
     )
     configuration.add_argument(
         "--config-ignore",
@@ -374,13 +595,30 @@ def build_parser():
         help="Enable .netrc authentication data",
     )
 
-    selection = parser.add_argument_group("Selection Options")
-    selection.add_argument(
-        "--download-archive",
-        dest="archive", metavar="FILE", action=ConfigAction,
-        help=("Record all downloaded or skipped files in FILE and "
-              "skip downloading any file already in it"),
+    cookies = parser.add_argument_group("Cookie Options")
+    cookies.add_argument(
+        "-C", "--cookies",
+        dest="cookies", metavar="FILE", action=ConfigAction,
+        help="File to load additional cookies from",
     )
+    cookies.add_argument(
+        "--cookies-export",
+        dest="cookies-update", metavar="FILE", action=ConfigAction,
+        help="Export session cookies to FILE",
+    )
+    cookies.add_argument(
+        "--cookies-from-browser",
+        dest="cookies_from_browser",
+        metavar="BROWSER[/DOMAIN][+KEYRING][:PROFILE][::CONTAINER]",
+        help=("Name of the browser to load cookies from, with optional "
+              "domain prefixed with '/', "
+              "keyring name prefixed with '+', "
+              "profile prefixed with ':', and "
+              "container prefixed with '::' "
+              "('none' for no container (default), 'all' for all containers)"),
+    )
+
+    selection = parser.add_argument_group("Selection Options")
     selection.add_argument(
         "-A", "--abort",
         dest="abort", metavar="N", type=int,
@@ -392,6 +630,22 @@ def build_parser():
         dest="terminate", metavar="N", type=int,
         help=("Stop current and parent extractor runs "
               "after N consecutive file downloads were skipped"),
+    )
+    selection.add_argument(
+        "--filesize-min",
+        dest="filesize-min", metavar="SIZE", action=ConfigAction,
+        help="Do not download files smaller than SIZE (e.g. 500k or 2.5M)",
+    )
+    selection.add_argument(
+        "--filesize-max",
+        dest="filesize-max", metavar="SIZE", action=ConfigAction,
+        help="Do not download files larger than SIZE (e.g. 500k or 2.5M)",
+    )
+    selection.add_argument(
+        "--download-archive",
+        dest="archive", metavar="FILE", action=ConfigAction,
+        help=("Record all downloaded or skipped files in FILE and "
+              "skip downloading any file already in it"),
     )
     selection.add_argument(
         "--range",
@@ -429,43 +683,20 @@ def build_parser():
     }
     postprocessor = parser.add_argument_group("Post-processing Options")
     postprocessor.add_argument(
-        "--zip",
-        dest="postprocessors",
-        action="append_const", const="zip",
-        help="Store downloaded files in a ZIP archive",
+        "-P", "--postprocessor",
+        dest="postprocessors", metavar="NAME", action="append",
+        help="Activate the specified post processor",
     )
     postprocessor.add_argument(
-        "--ugoira-conv",
-        dest="postprocessors", action="append_const", const={
-            "name"          : "ugoira",
-            "ffmpeg-args"   : ("-c:v", "libvpx", "-crf", "4", "-b:v", "5000k"),
-            "ffmpeg-twopass": True,
-            "whitelist"     : ("pixiv", "danbooru"),
-        },
-        help="Convert Pixiv Ugoira to WebM (requires FFmpeg)",
+        "--no-postprocessors",
+        dest="postprocess", nargs=0, action=ConfigConstAction, const=False,
+        help=("Do not run any post processors")
     )
     postprocessor.add_argument(
-        "--ugoira-conv-lossless",
-        dest="postprocessors", action="append_const", const={
-            "name"          : "ugoira",
-            "ffmpeg-args"   : ("-c:v", "libvpx-vp9", "-lossless", "1",
-                               "-pix_fmt", "yuv420p"),
-            "ffmpeg-twopass": False,
-            "whitelist"     : ("pixiv", "danbooru"),
-        },
-        help="Convert Pixiv Ugoira to WebM in VP9 lossless mode",
-    )
-    postprocessor.add_argument(
-        "--ugoira-conv-copy",
-        dest="postprocessors", action="append_const", const={
-            "name"             : "ugoira",
-            "extension"        : "mkv",
-            "ffmpeg-args"      : ("-c:v", "copy"),
-            "ffmpeg-twopass"   : False,
-            "repeat-last-frame": False,
-            "whitelist"        : ("pixiv", "danbooru"),
-        },
-        help="Convert Pixiv Ugoira to MKV without re-encoding any frames",
+        "-O", "--postprocessor-option",
+        dest="options_pp", metavar="KEY=VALUE",
+        action=PPParseAction, default={},
+        help="Additional post processor options",
     )
     postprocessor.add_argument(
         "--write-metadata",
@@ -492,16 +723,74 @@ def build_parser():
         help="Write image tags to separate text files",
     )
     postprocessor.add_argument(
-        "--mtime-from-date",
+        "--zip",
         dest="postprocessors",
-        action="append_const", const="mtime",
-        help="Set file modification times according to 'date' metadata",
+        action="append_const", const="zip",
+        help="Store downloaded files in a ZIP archive",
+    )
+    postprocessor.add_argument(
+        "--cbz",
+        dest="postprocessors",
+        action="append_const", const={
+            "name"     : "zip",
+            "extension": "cbz",
+        },
+        help="Store downloaded files in a CBZ archive",
+    )
+    postprocessor.add_argument(
+        "--mtime",
+        dest="postprocessors", metavar="NAME", action=MtimeAction,
+        help=("Set file modification times according to metadata "
+              "selected by NAME. Examples: 'date' or 'status[date]'"),
+    )
+    postprocessor.add_argument(
+        "--mtime-from-date",
+        dest="postprocessors", nargs=0, action=MtimeAction,
+        const="date|status[date]",
+        help=argparse.SUPPRESS,
+    )
+    postprocessor.add_argument(
+        "--rename",
+        dest="postprocessors", metavar="FORMAT", action=RenameAction, const=0,
+        help=("Rename previously downloaded files from FORMAT "
+              "to the current filename format"),
+    )
+    postprocessor.add_argument(
+        "--rename-to",
+        dest="postprocessors", metavar="FORMAT", action=RenameAction, const=1,
+        help=("Rename previously downloaded files from the current filename "
+              "format to FORMAT"),
+    )
+    postprocessor.add_argument(
+        "--ugoira",
+        dest="postprocessors", metavar="FMT", action=UgoiraAction,
+        help=("Convert Pixiv Ugoira to FMT using FFmpeg. "
+              "Supported formats are 'webm', 'mp4', 'gif', "
+              "'vp8', 'vp9', 'vp9-lossless', 'copy', 'zip'."),
+    )
+    postprocessor.add_argument(
+        "--ugoira-conv",
+        dest="postprocessors", nargs=0, action=UgoiraAction, const="vp8",
+        help=argparse.SUPPRESS,
+    )
+    postprocessor.add_argument(
+        "--ugoira-conv-lossless",
+        dest="postprocessors", nargs=0, action=UgoiraAction,
+        const="vp9-lossless",
+        help=argparse.SUPPRESS,
+    )
+    postprocessor.add_argument(
+        "--ugoira-conv-copy",
+        dest="postprocessors", nargs=0, action=UgoiraAction, const="copy",
+        help=argparse.SUPPRESS,
     )
     postprocessor.add_argument(
         "--exec",
         dest="postprocessors", metavar="CMD",
         action=AppendCommandAction, const={"name": "exec"},
         help=("Execute CMD for each downloaded file. "
+              "Supported replacement fields are "
+              "{} or {_path}, {_directory}, {_filename}. "
               "Example: --exec \"convert {} {}.png && rm {}\""),
     )
     postprocessor.add_argument(
@@ -509,24 +798,15 @@ def build_parser():
         dest="postprocessors", metavar="CMD",
         action=AppendCommandAction, const={
             "name": "exec", "event": "finalize"},
-        help=("Execute CMD after all files were downloaded successfully. "
-              "Example: --exec-after \"cd {} && convert * ../doc.pdf\""),
-    )
-    postprocessor.add_argument(
-        "-P", "--postprocessor",
-        dest="postprocessors", metavar="NAME", action="append",
-        help="Activate the specified post processor",
-    )
-    postprocessor.add_argument(
-        "-O", "--postprocessor-option",
-        dest="options_pp", metavar="OPT", action=OptionAction, default={},
-        help="Additional '<key>=<value>' post processor options",
+        help=("Execute CMD after all files were downloaded. "
+              "Example: --exec-after \"cd {_directory} "
+              "&& convert * ../doc.pdf\""),
     )
 
-    parser.add_argument(
-        "urls",
-        metavar="URL", nargs="*",
-        help=argparse.SUPPRESS,
-    )
+    try:
+        # restore normal behavior when adding '-4' or '-6' as arguments
+        parser._has_negative_number_optionals.clear()
+    except Exception:
+        pass
 
     return parser

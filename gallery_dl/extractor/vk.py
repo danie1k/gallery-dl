@@ -10,6 +10,7 @@
 
 from .common import Extractor, Message
 from .. import text, exception
+import re
 
 BASE_PATTERN = r"(?:https://)?(?:www\.|m\.)?vk\.com"
 
@@ -21,9 +22,17 @@ class VkExtractor(Extractor):
     filename_fmt = "{id}.{extension}"
     archive_fmt = "{id}"
     root = "https://vk.com"
-    request_interval = 1.0
+    request_interval = (0.5, 1.5)
+
+    def _init(self):
+        self.offset = text.parse_int(self.config("offset"))
+
+    def skip(self, num):
+        self.offset += num
+        return num
 
     def items(self):
+        sub = re.compile(r"/imp[fg]/").sub
         sizes = "wzyxrqpo"
 
         data = self.metadata()
@@ -40,10 +49,14 @@ class VkExtractor(Extractor):
                 continue
 
             try:
-                photo["url"] = photo[size + "src"]
+                url = photo[size + "src"]
             except KeyError:
                 self.log.warning("no photo URL found (%s)", photo.get("id"))
                 continue
+
+            photo["url"] = sub("/", url.partition("?")[0])
+            #  photo["url"] = url
+            photo["_fallback"] = (url,)
 
             try:
                 _, photo["width"], photo["height"] = photo[size]
@@ -69,7 +82,7 @@ class VkExtractor(Extractor):
             "al"       : "1",
             "direction": "1",
             "list"     : photos_id,
-            "offset"   : 0,
+            "offset"   : self.offset,
         }
 
         while True:
@@ -105,43 +118,7 @@ class VkPhotosExtractor(VkExtractor):
     pattern = (BASE_PATTERN + r"/(?:"
                r"(?:albums|photos|id)(-?\d+)"
                r"|(?!(?:album|tag)-?\d+_?)([^/?#]+))")
-    test = (
-        ("https://vk.com/id398982326", {
-            "pattern": r"https://sun\d+-\d+\.userapi\.com/s/v1/if1"
-                       r"/[\w-]+\.jpg\?size=\d+x\d+&quality=96&type=album",
-            "count": ">= 35",
-            "keyword": {
-                "id": r"re:\d+",
-                "user": {
-                    "id": "398982326",
-                    "info": "Мы за Движуху! – m1ni SounD #4 [EROmusic]",
-                    "name": "",
-                    "nick": "Dobrov Kurva",
-                },
-            },
-        }),
-        ("https://vk.com/cosplayinrussia", {
-            "range": "15-25",
-            "keyword": {
-                "id": r"re:\d+",
-                "user": {
-                    "id"  : "-165740836",
-                    "info": str,
-                    "name": "cosplayinrussia",
-                    "nick": "Косплей | Cosplay 18+",
-                },
-            },
-        }),
-        # photos without width/height (#2535)
-        ("https://vk.com/id76957806", {
-            "pattern": r"https://sun\d+-\d+\.userapi\.com/",
-            "range": "1-9",
-            "count": 9,
-        }),
-        ("https://m.vk.com/albums398982326"),
-        ("https://www.vk.com/id398982326?profile=1"),
-        ("https://vk.com/albums-165740836"),
-    )
+    example = "https://vk.com/id12345"
 
     def __init__(self, match):
         VkExtractor.__init__(self, match)
@@ -181,18 +158,7 @@ class VkAlbumExtractor(VkExtractor):
     subcategory = "album"
     directory_fmt = ("{category}", "{user[id]}", "{album[id]}")
     pattern = BASE_PATTERN + r"/album(-?\d+)_(\d+)$"
-    test = (
-        ("https://vk.com/album-165740836_281339889", {
-            "count": 12,
-        }),
-        # "Access denied" (#2556)
-        ("https://vk.com/album-53775183_00", {
-            "exception": exception.AuthorizationError,
-        }),
-        ("https://vk.com/album232175027_00", {
-            "exception": exception.AuthorizationError,
-        }),
-    )
+    example = "https://vk.com/album12345_00"
 
     def __init__(self, match):
         VkExtractor.__init__(self, match)
@@ -214,11 +180,7 @@ class VkTaggedExtractor(VkExtractor):
     subcategory = "tagged"
     directory_fmt = ("{category}", "{user[id]}", "tags")
     pattern = BASE_PATTERN + r"/tag(-?\d+)$"
-    test = (
-        ("https://vk.com/tag304303884", {
-            "count": 44,
-        }),
-    )
+    example = "https://vk.com/tag12345"
 
     def __init__(self, match):
         VkExtractor.__init__(self, match)

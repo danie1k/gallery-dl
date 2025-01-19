@@ -9,6 +9,7 @@
 """String formatters"""
 
 import os
+import sys
 import time
 import string
 import _string
@@ -181,9 +182,10 @@ class StringFormatter():
                     if obj:
                         break
                 except Exception:
-                    pass
+                    obj = None
             else:
-                obj = self.default
+                if obj is None:
+                    obj = self.default
             return fmt(obj)
         return wrap
 
@@ -210,7 +212,7 @@ class ModuleFormatter():
     """Generate text by calling an external function"""
 
     def __init__(self, function_spec, default=NONE, fmt=None):
-        module_name, _, function_name = function_spec.partition(":")
+        module_name, _, function_name = function_spec.rpartition(":")
         module = util.import_file(module_name)
         self.format_map = getattr(module, function_name)
 
@@ -234,19 +236,18 @@ class TemplateFormatter(StringFormatter):
 class TemplateFStringFormatter(FStringFormatter):
     """Read f-string from file"""
 
-    def __init__(self, path, default=NONE, fmt=format):
+    def __init__(self, path, default=NONE, fmt=None):
         with open(util.expand_path(path)) as fp:
-            format_string = fp.read()
-        FStringFormatter.__init__(self, format_string, default, fmt)
+            fstring = fp.read()
+        FStringFormatter.__init__(self, fstring, default, fmt)
 
 
 def parse_field_name(field_name):
+    if field_name[0] == "'":
+        return "_lit", (operator.itemgetter(field_name[1:-1]),)
+
     first, rest = _string.formatter_field_name_split(field_name)
     funcs = []
-
-    if first[0] == "'":
-        funcs.append(operator.itemgetter(first[1:-1]))
-        first = "_lit"
 
     for is_attr, key in rest:
         if is_attr:
@@ -255,7 +256,11 @@ def parse_field_name(field_name):
             func = operator.itemgetter
             try:
                 if ":" in key:
-                    key = _slice(key)
+                    if key[0] == "b":
+                        func = _bytesgetter
+                        key = _slice(key[1:])
+                    else:
+                        key = _slice(key)
                 else:
                     key = key.strip("\"'")
             except TypeError:
@@ -274,6 +279,14 @@ def _slice(indices):
         int(stop) if stop else None,
         int(step) if step else None,
     )
+
+
+def _bytesgetter(slice, encoding=sys.getfilesystemencoding()):
+
+    def apply_slice_bytes(obj):
+        return obj.encode(encoding)[slice].decode(encoding, "ignore")
+
+    return apply_slice_bytes
 
 
 def _build_format_func(format_spec, default):
@@ -295,12 +308,58 @@ def _parse_optional(format_spec, default):
 
 def _parse_slice(format_spec, default):
     indices, _, format_spec = format_spec.partition("]")
-    slice = _slice(indices[1:])
     fmt = _build_format_func(format_spec, default)
 
-    def apply_slice(obj):
-        return fmt(obj[slice])
+    if indices[1] == "b":
+        slice_bytes = _bytesgetter(_slice(indices[2:]))
+
+        def apply_slice(obj):
+            return fmt(slice_bytes(obj))
+
+    else:
+        slice = _slice(indices[1:])
+
+        def apply_slice(obj):
+            return fmt(obj[slice])
+
     return apply_slice
+
+
+def _parse_arithmetic(format_spec, default):
+    op, _, format_spec = format_spec.partition(_SEPARATOR)
+    fmt = _build_format_func(format_spec, default)
+
+    value = int(op[2:])
+    op = op[1]
+
+    if op == "+":
+        return lambda obj: fmt(obj + value)
+    if op == "-":
+        return lambda obj: fmt(obj - value)
+    if op == "*":
+        return lambda obj: fmt(obj * value)
+
+    return fmt
+
+
+def _parse_conversion(format_spec, default):
+    conversions, _, format_spec = format_spec.partition(_SEPARATOR)
+    convs = [_CONVERSIONS[c] for c in conversions[1:]]
+    fmt = _build_format_func(format_spec, default)
+
+    if len(conversions) <= 2:
+
+        def convert_one(obj):
+            return fmt(conv(obj))
+        conv = _CONVERSIONS[conversions[1]]
+        return convert_one
+
+    def convert_many(obj):
+        for conv in convs:
+            obj = conv(obj)
+        return fmt(obj)
+    convs = [_CONVERSIONS[c] for c in conversions[1:]]
+    return convert_many
 
 
 def _parse_maxlen(format_spec, default):
@@ -352,18 +411,18 @@ def _parse_offset(format_spec, default):
     fmt = _build_format_func(format_spec, default)
 
     if not offset or offset == "local":
-        is_dst = time.daylight and time.localtime().tm_isdst > 0
-        offset = -(time.altzone if is_dst else time.timezone)
+        def off(dt):
+            local = time.localtime(util.datetime_to_timestamp(dt))
+            return fmt(dt + datetime.timedelta(0, local.tm_gmtoff))
     else:
         hours, _, minutes = offset.partition(":")
         offset = 3600 * int(hours)
         if minutes:
             offset += 60 * (int(minutes) if offset > 0 else -int(minutes))
+        offset = datetime.timedelta(0, offset)
 
-    offset = datetime.timedelta(seconds=offset)
-
-    def off(obj):
-        return fmt(obj + offset)
+        def off(obj):
+            return fmt(obj + offset)
     return off
 
 
@@ -379,6 +438,19 @@ def _parse_sort(format_spec, default):
         def sort_asc(obj):
             return fmt(sorted(obj))
         return sort_asc
+
+
+def _parse_limit(format_spec, default):
+    limit, hint, format_spec = format_spec.split(_SEPARATOR, 2)
+    limit = int(limit[1:])
+    limit_hint = limit - len(hint)
+    fmt = _build_format_func(format_spec, default)
+
+    def apply_limit(obj):
+        if len(obj) > limit:
+            obj = obj[:limit_hint] + hint
+        return fmt(obj)
+    return apply_limit
 
 
 def _default_format(format_spec, default):
@@ -404,6 +476,7 @@ _GLOBALS = {
     "_env": lambda: os.environ,
     "_lit": lambda: _literal,
     "_now": datetime.datetime.now,
+    "_nul": lambda: util.NONE,
 }
 _CONVERSIONS = {
     "l": str.lower,
@@ -412,9 +485,11 @@ _CONVERSIONS = {
     "C": string.capwords,
     "j": util.json_dumps,
     "t": str.strip,
+    "L": len,
     "T": util.datetime_to_timestamp_string,
     "d": text.parse_timestamp,
     "U": text.unescape,
+    "H": lambda s: text.unescape(text.remove_html(s)),
     "g": text.slugify,
     "S": util.to_string,
     "s": str,
@@ -424,10 +499,13 @@ _CONVERSIONS = {
 _FORMAT_SPECIFIERS = {
     "?": _parse_optional,
     "[": _parse_slice,
+    "A": _parse_arithmetic,
+    "C": _parse_conversion,
     "D": _parse_datetime,
-    "L": _parse_maxlen,
     "J": _parse_join,
+    "L": _parse_maxlen,
     "O": _parse_offset,
     "R": _parse_replace,
     "S": _parse_sort,
+    "X": _parse_limit,
 }

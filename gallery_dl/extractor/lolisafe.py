@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2021-2022 Mike Fährmann
+# Copyright 2021-2023 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -20,35 +20,22 @@ class LolisafeExtractor(BaseExtractor):
 
 
 BASE_PATTERN = LolisafeExtractor.update({
-    "xbunkr": {
-        "root": "https://xbunkr.com",
-        "pattern": r"xbunkr\.com",
-    },
 })
 
 
 class LolisafeAlbumExtractor(LolisafeExtractor):
     subcategory = "album"
     pattern = BASE_PATTERN + "/a/([^/?#]+)"
-    test = (
-        ("https://xbunkr.com/a/TA0bu3F4", {
-            "pattern": r"https://media\.xbunkr\.com/[^.]+\.\w+",
-            "count": 861,
-            "keyword": {
-                "album_id": "TA0bu3F4",
-                "album_name": "Hannahowo Onlyfans Photos",
-            }
-        }),
-        ("https://xbunkr.com/a/GNQc2I5d"),
-    )
+    example = "https://xbunkr.com/a/ID"
 
     def __init__(self, match):
         LolisafeExtractor.__init__(self, match)
-        self.album_id = match.group(match.lastindex)
+        self.album_id = self.groups[-1]
 
+    def _init(self):
         domain = self.config("domain")
         if domain == "auto":
-            self.root = text.root_from_url(match.group(0))
+            self.root = text.root_from_url(self.url)
         elif domain:
             self.root = text.ensure_http_scheme(domain)
 
@@ -59,8 +46,27 @@ class LolisafeAlbumExtractor(LolisafeExtractor):
         for data["num"], file in enumerate(files, 1):
             url = file["file"]
             file.update(data)
-            text.nameext_from_url(url, file)
-            file["name"], sep, file["id"] = file["filename"].rpartition("-")
+
+            if "extension" not in file:
+                text.nameext_from_url(url, file)
+
+            if "name" in file:
+                name = file["name"]
+                file["name"] = name.rpartition(".")[0] or name
+                fid = file["filename"].rpartition("-")[2]
+                if len(fid) == 12:
+                    file["id"] = ""
+                    file["filename"] = file["name"]
+                else:
+                    file["id"] = fid
+                    file["filename"] = file["name"] + "-" + fid
+            elif "id" in file:
+                file["name"] = file["filename"]
+                file["filename"] = "{}-{}".format(file["name"], file["id"])
+            else:
+                file["name"], sep, file["id"] = \
+                    file["filename"].rpartition("-")
+
             yield Message.Url, url, file
 
     def fetch_album(self, album_id):

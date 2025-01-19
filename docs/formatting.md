@@ -11,14 +11,56 @@ Field names select the metadata value to use in a replacement field.
 
 While simple names are usually enough, more complex forms like accessing values by attribute, element index, or slicing are also supported.
 
-|                      | Example           | Result                 |
-| -------------------- | ----------------- | ---------------------- |
-| Name                 | `{title}`         | `Hello World`          |
-| Element Index        | `{title[6]}`      | `W`                    |
-| Slicing              | `{title[3:8]}`    | `lo Wo`                |
-| Alternatives         | `{empty\|title}`  | `Hello World`          |
-| Element Access       | `{user[name]}`    | `John Doe`             |
-| Attribute Access     | `{extractor.url}` | `https://example.org/` |
+<table>
+<thead>
+<tr>
+    <th></th>
+    <th>Example</th>
+    <th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+    <td>Name</td>
+    <td><code>{title}</code></td>
+    <td><code>Hello World</code></td>
+</tr>
+<tr>
+    <td>Element Index</td>
+    <td><code>{title[6]}</code></td>
+    <td><code>W</code></td>
+</tr>
+<tr>
+    <td>Slicing</td>
+    <td><code>{title[3:8]}</code></td>
+    <td><code>lo Wo</code></td>
+</tr>
+<tr>
+    <td>Slicing (Bytes)</td>
+    <td><code>{title_ja[b3:18]}</code></td>
+    <td><code>ロー・ワー</code></td>
+</tr>
+<tr>
+    <td>Alternatives</td>
+    <td><code>{empty|title}</code></td>
+    <td><code>Hello World</code></td>
+</tr>
+<tr>
+    <td>Attribute Access</td>
+    <td><code>{extractor.url}</code></td>
+    <td><code>https://example.org/</code></td>
+</tr>
+<tr>
+    <td rowspan="2">Element Access</td>
+    <td><code>{user[name]}</code></td>
+    <td><code>John Doe</code></td>
+</tr>
+<tr>
+    <td><code>{user['name']}</code></td>
+    <td><code>John Doe</code></td>
+</tr>
+</tbody>
+</table>
 
 All of these methods can be combined as needed.
 For example `{title[24]|empty|extractor.url[15:-1]}` would result in `.org`.
@@ -75,6 +117,12 @@ Conversion specifiers allow to *convert* the value to a different form or type. 
     <td><code>["sun", "tree", "water"]</code></td>
 </tr>
 <tr>
+    <td align="center"><code>L</code></td>
+    <td>Return the <a href="https://docs.python.org/3/library/functions.html#len" rel="nofollow">length</a> of a value</td>
+    <td><code>{foo!L}</code></td>
+    <td><code>7</code></td>
+</tr>
+<tr>
     <td align="center"><code>t</code></td>
     <td>Trim a string, i.e. remove leading and trailing whitespace characters</td>
     <td><code>{bar!t}</code></td>
@@ -82,15 +130,27 @@ Conversion specifiers allow to *convert* the value to a different form or type. 
 </tr>
 <tr>
     <td align="center"><code>T</code></td>
-    <td>Convert a <code>datetime</code> object to a unix timestamp</td>
+    <td>Convert a <code>datetime</code> object to a Unix timestamp</td>
     <td><code>{date!T}</code></td>
     <td><code>1262304000</code></td>
 </tr>
 <tr>
     <td align="center"><code>d</code></td>
-    <td>Convert a unix timestamp to a <code>datetime</code> object</td>
+    <td>Convert a Unix timestamp to a <code>datetime</code> object</td>
     <td><code>{created!d}</code></td>
     <td><code>2010-01-01 00:00:00</code></td>
+</tr>
+<tr>
+    <td align="center"><code>U</code></td>
+    <td>Convert HTML entities</td>
+    <td><code>{html!U}</code></td>
+    <td><code>&lt;p&gt;foo &amp; bar&lt;/p&gt;</code></td>
+</tr>
+<tr>
+    <td align="center"><code>H</code></td>
+    <td>Convert HTML entities &amp; remove HTML tags</td>
+    <td><code>{html!H}</code></td>
+    <td><code>foo &amp; bar</code></td>
 </tr>
 <tr>
     <td align="center"><code>s</code></td>
@@ -151,6 +211,12 @@ Format specifiers can be used for advanced formatting by using the options provi
     <td><code>oo&nbsp;Ba</code></td>
 </tr>
 <tr>
+    <td><code>[b&lt;start&gt;:&lt;stop&gt;]</code></td>
+    <td>Same as above, but applies to the <a href="https://docs.python.org/3/library/stdtypes.html#bytes"><code>bytes()</code></a> representation of a string in <a href="https://docs.python.org/3/library/sys.html#sys.getfilesystemencoding">filesystem encoding</a></td>
+    <td><code>{foo_ja:[b3:-1]}</code></td>
+    <td><code>ー・バ</code></td>
+</tr>
+<tr>
     <td rowspan="2"><code>L&lt;maxlen&gt;/&lt;repl&gt;/</code></td>
     <td rowspan="2">Replaces the entire output with <code>&lt;repl&gt;</code> if its length exceeds <code>&lt;maxlen&gt;</code></td>
     <td><code>{foo:L15/long/}</code></td>
@@ -159,6 +225,16 @@ Format specifiers can be used for advanced formatting by using the options provi
 <tr>
     <td><code>{foo:L3/long/}</code></td>
     <td><code>long</code></td>
+</tr>
+<tr>
+    <td rowspan="2"><code>X&lt;maxlen&gt;/&lt;ext&gt;/</code></td>
+    <td rowspan="2">Limit output to <code>&lt;maxlen&gt;</code> characters. Cut output and add <code>&lt;ext&gt;</code> to its end if its length exceeds <code>&lt;maxlen&gt;</code></td>
+    <td><code>{foo:X15/&nbsp;.../}</code></td>
+    <td><code>Foo&nbsp;Bar</code></td>
+</tr>
+<tr>
+    <td><code>{foo:L6/&nbsp;.../}</code></td>
+    <td><code>Fo&nbsp;...</code></td>
 </tr>
 <tr>
     <td><code>J&lt;separator&gt;/</code></td>
@@ -171,6 +247,18 @@ Format specifiers can be used for advanced formatting by using the options provi
     <td>Replaces all occurrences of <code>&lt;old&gt;</code> with <code>&lt;new&gt;</code> using <a href="https://docs.python.org/3/library/stdtypes.html#str.replace" rel="nofollow"><code>str.replace()</code></a></td>
     <td><code>{foo:Ro/()/}</code></td>
     <td><code>F()()&nbsp;Bar</code></td>
+</tr>
+<tr>
+    <td><code>A&lt;op&gt;&lt;value&gt;/</code></td>
+    <td>Apply arithmetic operation <code>&lt;op&gt;</code> (<code>+</code>, <code>-</code>, <code>*</code>) to the current value</td>
+    <td><code>{num:A+1/}</code></td>
+    <td><code>"2"</code></td>
+</tr>
+<tr>
+    <td><code>C&lt;conversion(s)&gt;/</code></td>
+    <td>Apply <a href="#conversions">Conversions</a> to the current value</td>
+    <td><code>{tags:CSgc/}</code></td>
+    <td><code>"Sun-tree-water"</code></td>
 </tr>
 <tr>
     <td><code>S&lt;order&gt;/</code></td>
@@ -193,7 +281,9 @@ Format specifiers can be used for advanced formatting by using the options provi
 </tbody>
 </table>
 
-All special format specifiers (`?`, `L`, `J`, `R`, `D`, `O`) can be chained and combined with one another, but must always come before any standard format specifiers:
+All special format specifiers (`?`, `L`, `J`, `R`, `D`, `O`, etc)
+can be chained and combined with one another,
+but must always appear before any standard format specifiers:
 
 For example `{foo:?//RF/B/Ro/e/> 10}` -> `   Bee Bar`
 - `?//` - Tests if `foo` has a value
@@ -229,6 +319,12 @@ Replacement field names that are available in all format strings.
     <td><code>2022-08</code></td>
 </tr>
 <tr>
+    <td><code>_nul</code></td>
+    <td>Universal <code>null</code> value</td>
+    <td><code>{date|_nul:%Y-%m}</code></td>
+    <td><code>None</code></td>
+</tr>
+<tr>
     <td rowspan="2"><code>_lit</code></td>
     <td rowspan="2">String literals</td>
     <td><code>{_lit[foo]}</code></td>
@@ -244,7 +340,7 @@ Replacement field names that are available in all format strings.
 
 ## Special Type Format Strings
 
-Starting a format string with '\f<Type> ' allows to set a different format string type than the default. Available ones are:
+Starting a format string with `\f<Type> ` allows to set a different format string type than the default. Available ones are:
 
 <table>
 <thead>
@@ -285,13 +381,3 @@ Starting a format string with '\f<Type> ' allows to set a different format strin
 </tr>
 </tbody>
 </table>
-
-> **Note:**
->
-> `\f` is the [Form Feed](https://en.wikipedia.org/w/index.php?title=Page_break&oldid=1027475805#Form_feed)
-> character. (ASCII code 12 or 0xc)
->
-> Writing it as `\f` is native to JSON, but will *not* get interpreted
-> as such by most shells. To use this character there:
-> * hold `Ctrl`, then press `v` followed by `l`, resulting in `^L` or
-> * use `echo` or `printf` (e.g. `gallery-dl -f "$(echo -ne \\fM) my_module:generate_text"`)

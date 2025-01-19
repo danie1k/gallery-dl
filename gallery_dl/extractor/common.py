@@ -14,13 +14,16 @@ import ssl
 import time
 import netrc
 import queue
+import random
+import getpass
 import logging
 import datetime
 import requests
 import threading
 from requests.adapters import HTTPAdapter
 from .message import Message
-from .. import config, text, util, cache, exception
+from .. import config, output, text, util, cache, exception
+urllib3 = requests.packages.urllib3
 
 
 class Extractor():
@@ -32,44 +35,26 @@ class Extractor():
     directory_fmt = ("{category}",)
     filename_fmt = "{filename}.{extension}"
     archive_fmt = ""
-    cookiedomain = ""
-    browser = None
     root = ""
-    test = None
-    finalize = None
+    cookies_domain = ""
+    cookies_index = 0
+    referer = True
+    ciphers = None
+    tls12 = True
+    browser = None
+    useragent = util.USERAGENT_FIREFOX
     request_interval = 0.0
     request_interval_min = 0.0
+    request_interval_429 = 60.0
     request_timestamp = 0.0
-    tls12 = True
 
     def __init__(self, match):
         self.log = logging.getLogger(self.category)
         self.url = match.string
-
-        if self.basecategory:
-            self.config = self._config_shared
-            self.config_accumulate = self._config_shared_accumulate
+        self.match = match
+        self.groups = match.groups()
         self._cfgpath = ("extractor", self.category, self.subcategory)
         self._parentdir = ""
-
-        self._write_pages = self.config("write-pages", False)
-        self._retry_codes = self.config("retry-codes")
-        self._retries = self.config("retries", 4)
-        self._timeout = self.config("timeout", 30)
-        self._verify = self.config("verify", True)
-        self._proxies = util.build_proxy_map(self.config("proxy"), self.log)
-        self._interval = util.build_duration_func(
-            self.config("sleep-request", self.request_interval),
-            self.request_interval_min,
-        )
-
-        if self._retries < 0:
-            self._retries = float("inf")
-        if not self._retry_codes:
-            self._retry_codes = ()
-
-        self._init_session()
-        self._init_cookies()
 
     @classmethod
     def from_url(cls, url):
@@ -79,7 +64,18 @@ class Extractor():
         return cls(match) if match else None
 
     def __iter__(self):
+        self.initialize()
         return self.items()
+
+    def initialize(self):
+        self._init_options()
+        self._init_session()
+        self._init_cookies()
+        self._init()
+        self.initialize = util.noop
+
+    def finalize(self):
+        pass
 
     def items(self):
         yield Message.Version, 1
@@ -90,23 +86,53 @@ class Extractor():
     def config(self, key, default=None):
         return config.interpolate(self._cfgpath, key, default)
 
+    def config2(self, key, key2, default=None, sentinel=util.SENTINEL):
+        value = self.config(key, sentinel)
+        if value is not sentinel:
+            return value
+        return self.config(key2, default)
+
+    def config_deprecated(self, key, deprecated, default=None,
+                          sentinel=util.SENTINEL, history=set()):
+        value = self.config(deprecated, sentinel)
+        if value is not sentinel:
+            if deprecated not in history:
+                history.add(deprecated)
+                self.log.warning("'%s' is deprecated. Use '%s' instead.",
+                                 deprecated, key)
+            default = value
+
+        value = self.config(key, sentinel)
+        if value is not sentinel:
+            return value
+        return default
+
     def config_accumulate(self, key):
         return config.accumulate(self._cfgpath, key)
 
+    def config_instance(self, key, default=None):
+        return default
+
     def _config_shared(self, key, default=None):
-        return config.interpolate_common(("extractor",), (
-            (self.category, self.subcategory),
-            (self.basecategory, self.subcategory),
-        ), key, default)
+        return config.interpolate_common(
+            ("extractor",), self._cfgpath, key, default)
 
     def _config_shared_accumulate(self, key):
-        values = config.accumulate(self._cfgpath, key)
-        conf = config.get(("extractor",), self.basecategory)
-        if conf:
-            values[:0] = config.accumulate((self.subcategory,), key, conf=conf)
+        first = True
+        extr = ("extractor",)
+
+        for path in self._cfgpath:
+            if first:
+                first = False
+                values = config.accumulate(extr + path, key)
+            else:
+                conf = config.get(extr, path[0])
+                if conf:
+                    values[:0] = config.accumulate(
+                        (self.subcategory,), key, conf=conf)
         return values
 
-    def request(self, url, *, method="GET", session=None,
+    def request(self, url, method="GET", session=None,
                 retries=None, retry_codes=None, encoding=None,
                 fatal=True, notfound=None, **kwargs):
         if session is None:
@@ -121,6 +147,18 @@ class Extractor():
             kwargs["timeout"] = self._timeout
         if "verify" not in kwargs:
             kwargs["verify"] = self._verify
+
+        if "json" in kwargs:
+            json = kwargs["json"]
+            if json is not None:
+                kwargs["data"] = util.json_dumps(json).encode()
+                del kwargs["json"]
+                headers = kwargs.get("headers")
+                if headers:
+                    headers["Content-Type"] = "application/json"
+                else:
+                    kwargs["headers"] = {"Content-Type": "application/json"}
+
         response = None
         tries = 1
 
@@ -133,30 +171,47 @@ class Extractor():
         while True:
             try:
                 response = session.request(method, url, **kwargs)
-            except (requests.exceptions.ConnectionError,
-                    requests.exceptions.Timeout,
+            except requests.exceptions.ConnectionError as exc:
+                code = 0
+                try:
+                    reason = exc.args[0].reason
+                    cls = reason.__class__.__name__
+                    pre, _, err = str(reason.args[-1]).partition(":")
+                    msg = " {}: {}".format(cls, (err or pre).lstrip())
+                except Exception:
+                    msg = exc
+            except (requests.exceptions.Timeout,
                     requests.exceptions.ChunkedEncodingError,
                     requests.exceptions.ContentDecodingError) as exc:
                 msg = exc
+                code = 0
             except (requests.exceptions.RequestException) as exc:
                 raise exception.HttpError(exc)
             else:
                 code = response.status_code
                 if self._write_pages:
                     self._dump_response(response)
-                if 200 <= code < 400 or fatal is None and \
-                        (400 <= code < 500) or not fatal and \
-                        (400 <= code < 429 or 431 <= code < 500):
+                if (
+                    code < 400 or
+                    code < 500 and (
+                        not fatal and code != 429 or fatal is None) or
+                    fatal is ...
+                ):
                     if encoding:
                         response.encoding = encoding
                     return response
                 if notfound and code == 404:
                     raise exception.NotFoundError(notfound)
 
-                msg = "'{} {}' for '{}'".format(code, response.reason, url)
+                msg = "'{} {}' for '{}'".format(
+                    code, response.reason, response.url)
                 server = response.headers.get("Server")
                 if server and server.startswith("cloudflare") and \
                         code in (403, 503):
+                    mitigated = response.headers.get("cf-mitigated")
+                    if mitigated and mitigated.lower() == "challenge":
+                        self.log.warning("Cloudflare challenge")
+                        break
                     content = response.content
                     if b"_cf_chl_opt" in content or b"jschl-answer" in content:
                         self.log.warning("Cloudflare challenge")
@@ -164,7 +219,17 @@ class Extractor():
                     if b'name="captcha-bypass"' in content:
                         self.log.warning("Cloudflare CAPTCHA")
                         break
-                if code not in retry_codes and code < 500:
+                elif server and server.startswith("ddos-guard") and \
+                        code == 403:
+                    if b"/ddos-guard/js-challenge/" in response.content:
+                        self.log.warning("DDoS-Guard challenge")
+                        break
+
+                if code == 429 and self._handle_429(response):
+                    continue
+                elif code == 429 and self._interval_429:
+                    pass
+                elif code not in retry_codes and code < 500:
                     break
 
             finally:
@@ -173,15 +238,27 @@ class Extractor():
             self.log.debug("%s (%s/%s)", msg, tries, retries+1)
             if tries > retries:
                 break
-            self.sleep(
-                max(tries, self._interval()) if self._interval else tries,
-                "retry")
+
+            seconds = tries
+            if self._interval:
+                s = self._interval()
+                if seconds < s:
+                    seconds = s
+            if code == 429 and self._interval_429:
+                s = self._interval_429()
+                if seconds < s:
+                    seconds = s
+                self.wait(seconds=seconds, reason="429 Too Many Requests")
+            else:
+                self.sleep(seconds, "retry")
             tries += 1
 
         raise exception.HttpError(msg, response)
 
-    def wait(self, *, seconds=None, until=None, adjust=1.0,
-             reason="rate limit reset"):
+    _handle_429 = util.false
+
+    def wait(self, seconds=None, until=None, adjust=1.0,
+             reason="rate limit"):
         now = time.time()
 
         if seconds:
@@ -204,13 +281,32 @@ class Extractor():
         if reason:
             t = datetime.datetime.fromtimestamp(until).time()
             isotime = "{:02}:{:02}:{:02}".format(t.hour, t.minute, t.second)
-            self.log.info("Waiting until %s for %s.", isotime, reason)
+            self.log.info("Waiting until %s (%s)", isotime, reason)
         time.sleep(seconds)
 
     def sleep(self, seconds, reason):
         self.log.debug("Sleeping %.2f seconds (%s)",
                        seconds, reason)
         time.sleep(seconds)
+
+    def input(self, prompt, echo=True):
+        self._check_input_allowed(prompt)
+
+        if echo:
+            try:
+                return input(prompt)
+            except (EOFError, OSError):
+                return None
+        else:
+            return getpass.getpass(prompt)
+
+    def _check_input_allowed(self, prompt=""):
+        input = self.config("input")
+        if input is None:
+            input = output.TTY_STDIN
+        if not input:
+            raise exception.StopExtraction(
+                "User input required (%s)", prompt.strip(" :"))
 
     def _get_auth_info(self):
         """Return authentication information as (username, password) tuple"""
@@ -219,6 +315,10 @@ class Extractor():
 
         if username:
             password = self.config("password")
+            if not password:
+                self._check_input_allowed("password")
+                password = util.LazyPrompt()
+
         elif self.config("netrc", False):
             try:
                 info = netrc.netrc().authenticators(self.category)
@@ -230,11 +330,37 @@ class Extractor():
 
         return username, password
 
+    def _init(self):
+        pass
+
+    def _init_options(self):
+        self._write_pages = self.config("write-pages", False)
+        self._retry_codes = self.config("retry-codes")
+        self._retries = self.config("retries", 4)
+        self._timeout = self.config("timeout", 30)
+        self._verify = self.config("verify", True)
+        self._proxies = util.build_proxy_map(self.config("proxy"), self.log)
+        self._interval = util.build_duration_func(
+            self.config("sleep-request", self.request_interval),
+            self.request_interval_min,
+        )
+        self._interval_429 = util.build_duration_func(
+            self.config("sleep-429", self.request_interval_429),
+        )
+
+        if self._retries < 0:
+            self._retries = float("inf")
+        if not self._retry_codes:
+            self._retry_codes = ()
+
     def _init_session(self):
         self.session = session = requests.Session()
         headers = session.headers
         headers.clear()
         ssl_options = ssl_ciphers = 0
+
+        # .netrc Authorization headers are alwsays disabled
+        session.trust_env = True if self.config("proxy-env", True) else False
 
         browser = self.config("browser")
         if browser is None:
@@ -269,19 +395,31 @@ class Extractor():
             ssl_ciphers = SSL_CIPHERS[browser]
         else:
             useragent = self.config("user-agent")
-            if useragent is None:
-                useragent = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; "
-                             "rv:102.0) Gecko/20100101 Firefox/102.0")
+            if useragent is None or useragent == "auto":
+                useragent = self.useragent
             elif useragent == "browser":
                 useragent = _browser_useragent()
+            elif self.useragent is not Extractor.useragent and \
+                    useragent is config.get(("extractor",), "user-agent"):
+                useragent = self.useragent
             headers["User-Agent"] = useragent
             headers["Accept"] = "*/*"
             headers["Accept-Language"] = "en-US,en;q=0.5"
+            ssl_ciphers = self.ciphers
 
         if BROTLI:
             headers["Accept-Encoding"] = "gzip, deflate, br"
         else:
             headers["Accept-Encoding"] = "gzip, deflate"
+        if ZSTD:
+            headers["Accept-Encoding"] += ", zstd"
+
+        referer = self.config("referer", self.referer)
+        if referer:
+            if isinstance(referer, str):
+                headers["Referer"] = referer
+            elif self.root:
+                headers["Referer"] = self.root + "/"
 
         custom_headers = self.config("headers")
         if custom_headers:
@@ -315,93 +453,118 @@ class Extractor():
 
     def _init_cookies(self):
         """Populate the session's cookiejar"""
-        self._cookiefile = None
-        self._cookiejar = self.session.cookies
-        if self.cookiedomain is None:
+        self.cookies = self.session.cookies
+        self.cookies_file = None
+        if self.cookies_domain is None:
             return
 
         cookies = self.config("cookies")
         if cookies:
-            if isinstance(cookies, dict):
-                self._update_cookies_dict(cookies, self.cookiedomain)
+            select = self.config("cookies-select")
+            if select:
+                if select == "rotate":
+                    cookies = cookies[self.cookies_index % len(cookies)]
+                    Extractor.cookies_index += 1
+                else:
+                    cookies = random.choice(cookies)
+            self.cookies_load(cookies)
 
-            elif isinstance(cookies, str):
-                cookiefile = util.expand_path(cookies)
+    def cookies_load(self, cookies_source):
+        if isinstance(cookies_source, dict):
+            self.cookies_update_dict(cookies_source, self.cookies_domain)
+
+        elif isinstance(cookies_source, str):
+            path = util.expand_path(cookies_source)
+            try:
+                with open(path) as fp:
+                    cookies = util.cookiestxt_load(fp)
+            except Exception as exc:
+                self.log.warning("cookies: %s", exc)
+            else:
+                self.log.debug("Loading cookies from '%s'", cookies_source)
+                set_cookie = self.cookies.set_cookie
+                for cookie in cookies:
+                    set_cookie(cookie)
+                self.cookies_file = path
+
+        elif isinstance(cookies_source, (list, tuple)):
+            key = tuple(cookies_source)
+            cookies = _browser_cookies.get(key)
+
+            if cookies is None:
+                from ..cookies import load_cookies
                 try:
-                    with open(cookiefile) as fp:
-                        util.cookiestxt_load(fp, self._cookiejar)
+                    cookies = load_cookies(cookies_source)
                 except Exception as exc:
                     self.log.warning("cookies: %s", exc)
+                    cookies = ()
                 else:
-                    self.log.debug("Loading cookies from '%s'", cookies)
-                    self._cookiefile = cookiefile
-
-            elif isinstance(cookies, (list, tuple)):
-                key = tuple(cookies)
-                cookiejar = _browser_cookies.get(key)
-
-                if cookiejar is None:
-                    from ..cookies import load_cookies
-                    cookiejar = self._cookiejar.__class__()
-                    try:
-                        load_cookies(cookiejar, cookies)
-                    except Exception as exc:
-                        self.log.warning("cookies: %s", exc)
-                    else:
-                        _browser_cookies[key] = cookiejar
-                else:
-                    self.log.debug("Using cached cookies from %s", key)
-
-                setcookie = self._cookiejar.set_cookie
-                for cookie in cookiejar:
-                    setcookie(cookie)
-
+                    _browser_cookies[key] = cookies
             else:
-                self.log.warning(
-                    "Expected 'dict', 'list', or 'str' value for 'cookies' "
-                    "option, got '%s' (%s)",
-                    cookies.__class__.__name__, cookies)
+                self.log.debug("Using cached cookies from %s", key)
 
-    def _store_cookies(self):
-        """Store the session's cookiejar in a cookies.txt file"""
-        if self._cookiefile and self.config("cookies-update", True):
-            try:
-                with open(self._cookiefile, "w") as fp:
-                    util.cookiestxt_store(fp, self._cookiejar)
-            except OSError as exc:
-                self.log.warning("cookies: %s", exc)
+            set_cookie = self.cookies.set_cookie
+            for cookie in cookies:
+                set_cookie(cookie)
 
-    def _update_cookies(self, cookies, *, domain=""):
+        else:
+            self.log.warning(
+                "Expected 'dict', 'list', or 'str' value for 'cookies' "
+                "option, got '%s' (%s)",
+                cookies_source.__class__.__name__, cookies_source)
+
+    def cookies_store(self):
+        """Store the session's cookies in a cookies.txt file"""
+        export = self.config("cookies-update", True)
+        if not export:
+            return
+
+        if isinstance(export, str):
+            path = util.expand_path(export)
+        else:
+            path = self.cookies_file
+            if not path:
+                return
+
+        path_tmp = path + ".tmp"
+        try:
+            with open(path_tmp, "w") as fp:
+                util.cookiestxt_store(fp, self.cookies)
+            os.replace(path_tmp, path)
+        except OSError as exc:
+            self.log.warning("cookies: %s", exc)
+
+    def cookies_update(self, cookies, domain=""):
         """Update the session's cookiejar with 'cookies'"""
         if isinstance(cookies, dict):
-            self._update_cookies_dict(cookies, domain or self.cookiedomain)
+            self.cookies_update_dict(cookies, domain or self.cookies_domain)
         else:
-            setcookie = self._cookiejar.set_cookie
+            set_cookie = self.cookies.set_cookie
             try:
                 cookies = iter(cookies)
             except TypeError:
-                setcookie(cookies)
+                set_cookie(cookies)
             else:
                 for cookie in cookies:
-                    setcookie(cookie)
+                    set_cookie(cookie)
 
-    def _update_cookies_dict(self, cookiedict, domain):
+    def cookies_update_dict(self, cookiedict, domain):
         """Update cookiejar with name-value pairs from a dict"""
-        setcookie = self._cookiejar.set
+        set_cookie = self.cookies.set
         for name, value in cookiedict.items():
-            setcookie(name, value, domain=domain)
+            set_cookie(name, value, domain=domain)
 
-    def _check_cookies(self, cookienames, *, domain=None):
-        """Check if all 'cookienames' are in the session's cookiejar"""
-        if not self._cookiejar:
+    def cookies_check(self, cookies_names, domain=None):
+        """Check if all 'cookies_names' are in the session's cookiejar"""
+        if not self.cookies:
             return False
 
         if domain is None:
-            domain = self.cookiedomain
-        names = set(cookienames)
+            domain = self.cookies_domain
+        names = set(cookies_names)
         now = time.time()
 
-        for cookie in self._cookiejar:
+        for cookie in self.cookies:
             if cookie.name in names and (
                     not domain or cookie.domain == domain):
 
@@ -424,10 +587,25 @@ class Extractor():
                     return True
         return False
 
+    def _extract_jsonld(self, page):
+        return util.json_loads(text.extr(
+            page, '<script type="application/ld+json">', "</script>"))
+
+    def _extract_nextdata(self, page):
+        return util.json_loads(text.extr(
+            page, ' id="__NEXT_DATA__" type="application/json">', "</script>"))
+
     def _prepare_ddosguard_cookies(self):
-        if not self._cookiejar.get("__ddg2", domain=self.cookiedomain):
-            self._cookiejar.set(
-                "__ddg2", util.generate_token(), domain=self.cookiedomain)
+        if not self.cookies.get("__ddg2", domain=self.cookies_domain):
+            self.cookies.set(
+                "__ddg2", util.generate_token(), domain=self.cookies_domain)
+
+    def _cache(self, func, maxage, keyarg=None):
+        #  return cache.DatabaseCacheDecorator(func, maxage, keyarg)
+        return cache.DatabaseCacheDecorator(func, keyarg, maxage)
+
+    def _cache_memory(self, func, maxage=None, keyarg=None):
+        return cache.Memcache()
 
     def _get_date_min_max(self, dmin=None, dmax=None):
         """Retrieve and parse 'date-min' and 'date-max' config values"""
@@ -454,29 +632,21 @@ class Extractor():
         if include == "all":
             include = extractors
         elif isinstance(include, str):
-            include = include.split(",")
+            include = include.replace(" ", "").split(",")
 
         result = [(Message.Version, 1)]
         for category in include:
-            if category in extractors:
+            try:
                 extr, url = extractors[category]
+            except KeyError:
+                self.log.warning("Invalid include '%s'", category)
+            else:
                 result.append((Message.Queue, url, {"_extractor": extr}))
         return iter(result)
 
     @classmethod
-    def _get_tests(cls):
-        """Yield an extractor's test cases as (URL, RESULTS) tuples"""
-        tests = cls.test
-        if not tests:
-            return
-
-        if len(tests) == 2 and (not tests[1] or isinstance(tests[1], dict)):
-            tests = (tests,)
-
-        for test in tests:
-            if isinstance(test, str):
-                test = (test, None)
-            yield test
+    def _dump(cls, obj):
+        util.dump_json(obj, ensure_ascii=False, indent=2)
 
     def _dump_response(self, response, history=True):
         """Write the response content to a .dump file in the current directory.
@@ -511,6 +681,8 @@ class Extractor():
                     headers=(self._write_pages in ("all", "ALL")),
                     hide_auth=(self._write_pages != "ALL")
                 )
+            self.log.info("Writing '%s' response to '%s'",
+                          response.url, path + ".txt")
         except Exception as e:
             self.log.warning("Failed to dump HTTP request (%s: %s)",
                              e.__class__.__name__, e)
@@ -526,11 +698,17 @@ class GalleryExtractor(Extractor):
 
     def __init__(self, match, url=None):
         Extractor.__init__(self, match)
-        self.gallery_url = self.root + match.group(1) if url is None else url
+        self.gallery_url = self.root + self.groups[0] if url is None else url
 
     def items(self):
         self.login()
-        page = self.request(self.gallery_url, notfound=self.subcategory).text
+
+        if self.gallery_url:
+            page = self.request(
+                self.gallery_url, notfound=self.subcategory).text
+        else:
+            page = None
+
         data = self.metadata(page)
         imgs = self.images(page)
 
@@ -595,14 +773,18 @@ class MangaExtractor(Extractor):
 
     def __init__(self, match, url=None):
         Extractor.__init__(self, match)
-        self.manga_url = url or self.root + match.group(1)
+        self.manga_url = self.root + self.groups[0] if url is None else url
 
         if self.config("chapter-reverse", False):
             self.reverse = not self.reverse
 
     def items(self):
         self.login()
-        page = self.request(self.manga_url).text
+
+        if self.manga_url:
+            page = self.request(self.manga_url, notfound=self.subcategory).text
+        else:
+            page = None
 
         chapters = self.chapters(page)
         if self.reverse:
@@ -623,6 +805,8 @@ class AsynchronousMixin():
     """Run info extraction in a separate thread"""
 
     def __iter__(self):
+        self.initialize()
+
         messages = queue.Queue(5)
         thread = threading.Thread(
             target=self.async_items,
@@ -656,16 +840,19 @@ class BaseExtractor(Extractor):
 
     def __init__(self, match):
         if not self.category:
-            self._init_category(match)
+            self.groups = match.groups()
+            self.match = match
+            self._init_category()
         Extractor.__init__(self, match)
 
-    def _init_category(self, match):
-        for index, group in enumerate(match.groups()):
+    def _init_category(self):
+        for index, group in enumerate(self.groups):
             if group is not None:
                 if index:
-                    self.category, self.root = self.instances[index-1]
+                    self.category, self.root, info = self.instances[index-1]
                     if not self.root:
-                        self.root = text.root_from_url(match.group(0))
+                        self.root = text.root_from_url(self.match.group(0))
+                    self.config_instance = info.get
                 else:
                     self.root = group
                     self.category = group.partition("://")[2]
@@ -685,7 +872,7 @@ class BaseExtractor(Extractor):
             root = info["root"]
             if root:
                 root = root.rstrip("/")
-            instance_list.append((category, root))
+            instance_list.append((category, root, info))
 
             pattern = info.get("pattern")
             if not pattern:
@@ -724,12 +911,12 @@ def _build_requests_adapter(ssl_options, ssl_ciphers, source_address):
         pass
 
     if ssl_options or ssl_ciphers:
-        ssl_context = ssl.create_default_context()
-        if ssl_options:
-            ssl_context.options |= ssl_options
-        if ssl_ciphers:
-            ssl_context.set_ecdh_curve("prime256v1")
-            ssl_context.set_ciphers(ssl_ciphers)
+        ssl_context = urllib3.connection.create_urllib3_context(
+            options=ssl_options or None, ciphers=ssl_ciphers)
+        if not requests.__version__ < "2.32":
+            # https://github.com/psf/requests/pull/6731
+            ssl_context.load_default_certs()
+        ssl_context.check_hostname = False
     else:
         ssl_context = None
 
@@ -746,10 +933,11 @@ def _browser_useragent():
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", 6414))
+    server.bind(("127.0.0.1", 0))
     server.listen(1)
 
-    webbrowser.open("http://127.0.0.1:6414/user-agent")
+    host, port = server.getsockname()
+    webbrowser.open("http://{}:{}/user-agent".format(host, port))
 
     client = server.accept()[0]
     server.close()
@@ -774,14 +962,13 @@ _browser_cookies = {}
 
 HTTP_HEADERS = {
     "firefox": (
-        ("User-Agent", "Mozilla/5.0 ({}; rv:102.0) "
-                       "Gecko/20100101 Firefox/102.0"),
+        ("User-Agent", "Mozilla/5.0 ({}; "
+                       "rv:128.0) Gecko/20100101 Firefox/128.0"),
         ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                   "image/avif,image/webp,*/*;q=0.8"),
+                   "image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8"),
         ("Accept-Language", "en-US,en;q=0.5"),
         ("Accept-Encoding", None),
         ("Referer", None),
-        ("DNT", "1"),
         ("Connection", "keep-alive"),
         ("Upgrade-Insecure-Requests", "1"),
         ("Cookie", None),
@@ -849,13 +1036,23 @@ SSL_CIPHERS = {
 }
 
 
-urllib3 = requests.packages.urllib3
+# disable Basic Authorization header injection from .netrc data
+try:
+    requests.sessions.get_netrc_auth = lambda _: None
+except Exception:
+    pass
 
 # detect brotli support
 try:
     BROTLI = urllib3.response.brotli is not None
 except AttributeError:
     BROTLI = False
+
+# detect zstandard support
+try:
+    ZSTD = urllib3.response.HAS_ZSTD
+except AttributeError:
+    ZSTD = False
 
 # set (urllib3) warnings filter
 action = config.get((), "warnings", "default")
@@ -866,13 +1063,3 @@ if action:
     except Exception:
         pass
 del action
-
-# Undo automatic pyOpenSSL injection by requests
-pyopenssl = config.get((), "pyopenssl", False)
-if not pyopenssl:
-    try:
-        from requests.packages.urllib3.contrib import pyopenssl  # noqa
-        pyopenssl.extract_from_urllib3()
-    except ImportError:
-        pass
-del pyopenssl

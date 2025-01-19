@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2016-2022 Mike Fährmann
+# Copyright 2016-2023 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -16,30 +16,13 @@ class KhinsiderSoundtrackExtractor(AsynchronousMixin, Extractor):
     """Extractor for soundtracks from khinsider.com"""
     category = "khinsider"
     subcategory = "soundtrack"
+    root = "https://downloads.khinsider.com"
     directory_fmt = ("{category}", "{album[name]}")
     archive_fmt = "{filename}.{extension}"
     pattern = (r"(?:https?://)?downloads\.khinsider\.com"
                r"/game-soundtracks/album/([^/?#]+)")
-    root = "https://downloads.khinsider.com"
-    test = (("https://downloads.khinsider.com"
-             "/game-soundtracks/album/horizon-riders-wii"), {
-        "pattern": r"https?://vgm(site|downloads)\.com"
-                   r"/soundtracks/horizon-riders-wii/[^/]+"
-                   r"/Horizon%20Riders%20Wii%20-%20Full%20Soundtrack\.mp3",
-        "keyword": {
-            "album": {
-                "count": 1,
-                "date": "Sep 18th, 2016",
-                "name": "Horizon Riders",
-                "platform": "Wii",
-                "size": 26214400,
-                "type": "Gamerip",
-            },
-            "extension": "mp3",
-            "filename": "Horizon Riders Wii - Full Soundtrack",
-        },
-        "count": 1,
-    })
+    example = ("https://downloads.khinsider.com"
+               "/game-soundtracks/album/TITLE")
 
     def __init__(self, match):
         Extractor.__init__(self, match)
@@ -53,22 +36,36 @@ class KhinsiderSoundtrackExtractor(AsynchronousMixin, Extractor):
 
         data = self.metadata(page)
         yield Message.Directory, data
-        for track in self.tracks(page):
+
+        if self.config("covers", False):
+            for num, url in enumerate(self._extract_covers(page), 1):
+                cover = text.nameext_from_url(
+                    url, {"url": url, "num": num, "type": "cover"})
+                cover.update(data)
+                yield Message.Url, url, cover
+
+        for track in self._extract_tracks(page):
             track.update(data)
+            track["type"] = "track"
             yield Message.Url, track["url"], track
 
     def metadata(self, page):
         extr = text.extract_from(page)
         return {"album": {
             "name" : text.unescape(extr("<h2>", "<")),
-            "platform": extr("Platforms: <a", "<").rpartition(">")[2],
+            "platform": text.split_html(extr("Platforms: ", "<br>"))[::2],
+            "year": extr("Year: <b>", "<"),
+            "catalog": extr("Catalog Number: <b>", "<"),
+            "developer": text.remove_html(extr(" Developed by: ", "</")),
+            "publisher": text.remove_html(extr(" Published by: ", "</")),
             "count": text.parse_int(extr("Number of Files: <b>", "<")),
             "size" : text.parse_bytes(extr("Total Filesize: <b>", "<")[:-1]),
             "date" : extr("Date Added: <b>", "<"),
             "type" : text.remove_html(extr("Album type: <b>", "</b>")),
+            "uploader": text.remove_html(extr("Uploaded by: ", "</")),
         }}
 
-    def tracks(self, page):
+    def _extract_tracks(self, page):
         fmt = self.config("format", ("mp3",))
         if fmt and isinstance(fmt, str):
             if fmt == "all":
@@ -92,3 +89,9 @@ class KhinsiderSoundtrackExtractor(AsynchronousMixin, Extractor):
                     yield track
             if first:
                 yield first
+
+    def _extract_covers(self, page):
+        return [
+            text.unescape(text.extr(cover, ' href="', '"'))
+            for cover in text.extract_iter(page, ' class="albumImage', '</')
+        ]

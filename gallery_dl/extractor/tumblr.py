@@ -9,7 +9,7 @@
 """Extractors for https://www.tumblr.com/"""
 
 from .common import Extractor, Message
-from .. import text, oauth, exception
+from .. import text, util, oauth, exception
 from datetime import datetime, date, timedelta
 import re
 
@@ -21,8 +21,8 @@ BASE_PATTERN = (
     r"([\w-]+\.tumblr\.com)))"
 )
 
-POST_TYPES = frozenset((
-    "text", "quote", "link", "answer", "video", "audio", "photo", "chat"))
+POST_TYPES = frozenset(("text", "quote", "link", "answer", "video",
+                        "audio", "photo", "chat", "search"))
 
 
 class TumblrExtractor(Extractor):
@@ -31,7 +31,6 @@ class TumblrExtractor(Extractor):
     directory_fmt = ("{category}", "{blog_name}")
     filename_fmt = "{category}_{blog_name}_{id}_{num:>02}.{extension}"
     archive_fmt = "{id}_{num}"
-    cookiedomain = None
 
     def __init__(self, match):
         Extractor.__init__(self, match)
@@ -42,6 +41,7 @@ class TumblrExtractor(Extractor):
         else:
             self.blog = match.group(1) or match.group(3)
 
+    def _init(self):
         self.api = TumblrAPI(self)
         self.types = self._setup_posttypes()
         self.avatar = self.config("avatar", False)
@@ -82,14 +82,21 @@ class TumblrExtractor(Extractor):
                 return
             if post["type"] not in self.types:
                 continue
-            if not blog:
-                blog = self.api.info(self.blog)
-                blog["uuid"] = self.blog
 
-                if self.avatar:
-                    url = self.api.avatar(self.blog)
-                    yield Message.Directory, {"blog": blog}
-                    yield self._prepare_avatar(url, post.copy(), blog)
+            if "blog" in post:
+                blog = post["blog"]
+                self.blog = blog["name"] + ".tumblr.com"
+            else:
+                if not blog:
+                    blog = self.api.info(self.blog)
+                    blog["uuid"] = self.blog
+
+                    if self.avatar:
+                        url = self.api.avatar(self.blog)
+                        yield Message.Directory, {"blog": blog}
+                        yield self._prepare_avatar(url, post.copy(), blog)
+
+                post["blog"] = blog
 
             reblog = "reblogged_from_id" in post
             if reblog and self._skip_reblog(post):
@@ -98,7 +105,6 @@ class TumblrExtractor(Extractor):
 
             if "trail" in post:
                 del post["trail"]
-            post["blog"] = blog
             post["date"] = text.parse_timestamp(post["timestamp"])
             posts = []
 
@@ -261,7 +267,7 @@ class TumblrExtractor(Extractor):
             return updated, (resized == updated)
 
     def _original_image_fallback(self, url, post_id):
-        for _ in range(self.fallback_retries):
+        for _ in util.repeat(self.fallback_retries):
             self.sleep(self.fallback_delay, "image token")
             yield self._update_image_token(url)[0]
         self.log.warning("Unable to fetch higher-resolution "
@@ -272,59 +278,7 @@ class TumblrUserExtractor(TumblrExtractor):
     """Extractor for a Tumblr user's posts"""
     subcategory = "user"
     pattern = BASE_PATTERN + r"(?:/page/\d+|/archive)?/?$"
-    test = (
-        ("http://demo.tumblr.com/", {
-            "pattern": r"https://\d+\.media\.tumblr\.com"
-                       r"/tumblr_[^/_]+_\d+\.jpg",
-            "count": 1,
-            "options": (("posts", "photo"),),
-        }),
-        ("http://demo.tumblr.com/", {
-            "pattern": (r"https?://(?:$|"
-                        r"\d+\.media\.tumblr\.com/.+_1280\.jpg|"
-                        r"a\.tumblr\.com/tumblr_\w+)"),
-            "count": 3,
-            "options": (("posts", "all"), ("external", True))
-        }),
-        ("https://mikf123-hidden.tumblr.com/", {  # dashboard-only
-            "options": (("access-token", None),),
-            "exception": exception.AuthorizationError,
-        }),
-        ("https://mikf123-hidden.tumblr.com/", {  # dashboard-only
-            "count": 2,
-            "keyword": {"tags": ["test", "hidden"]},
-        }),
-        ("https://mikf123-private.tumblr.com/", {  # password protected
-            "count": 2,
-            "keyword": {"tags": ["test", "private"]},
-        }),
-        ("https://mikf123-private-hidden.tumblr.com/", {  # both
-            "count": 2,
-            "keyword": {"tags": ["test", "private", "hidden"]},
-        }),
-        ("https://mikf123.tumblr.com/", {  # date-min/-max/-format (#337)
-            "count": 4,
-            "options": (("date-min", "201804"), ("date-max", "201805"),
-                        ("date-format", "%Y%m"))
-        }),
-        # pagination with 'date-max' (#2191) and 'api-key'
-        ("https://donttrustthetits.tumblr.com/", {
-            "options": (
-                ("access-token", None),
-                ("original", False),
-                ("date-max", "2015-04-25T00:00:00"),
-                ("date-min", "2015-04-01T00:00:00"),
-            ),
-            "count": 316,
-        }),
-        ("https://demo.tumblr.com/page/2"),
-        ("https://demo.tumblr.com/archive"),
-        ("tumblr:http://www.b-authentique.com/"),
-        ("tumblr:www.b-authentique.com"),
-        ("https://www.tumblr.com/blog/view/smarties-art"),
-        ("https://www.tumblr.com/blog/smarties-art"),
-        ("https://www.tumblr.com/smarties-art"),
-    )
+    example = "https://www.tumblr.com/BLOG"
 
     def posts(self):
         return self.api.posts(self.blog, {})
@@ -334,55 +288,7 @@ class TumblrPostExtractor(TumblrExtractor):
     """Extractor for a single Tumblr post"""
     subcategory = "post"
     pattern = BASE_PATTERN + r"/(?:post/|image/)?(\d+)"
-    test = (
-        ("http://demo.tumblr.com/post/459265350", {
-            "pattern": (r"https://\d+\.media\.tumblr\.com"
-                        r"/tumblr_[^/_]+_1280.jpg"),
-            "count": 1,
-        }),
-        ("https://mikf123.tumblr.com/post/167770226574/text-post", {
-            "count": 2,
-        }),
-        ("https://mikf123.tumblr.com/post/181022561719/quote-post", {
-            "count": 1,
-        }),
-        ("https://mikf123.tumblr.com/post/167623351559/link-post", {
-            "count": 2,
-        }),
-        ("https://mikf123.tumblr.com/post/167633596145/video-post", {
-            "count": 2,
-        }),
-        ("https://mikf123.tumblr.com/post/167770026604/audio-post", {
-            "count": 2,
-        }),
-        ("https://mikf123.tumblr.com/post/172687798174/photo-post", {
-            "count": 4,
-        }),
-        ("https://mikf123.tumblr.com/post/181022380064/chat-post", {
-            "count": 0,
-        }),
-        ("https://kichatundk.tumblr.com/post/654953419288821760", {
-            "count": 2,  # high-quality images (#1846)
-            "content": "d6fcc7b6f750d835d55c7f31fa3b63be26c9f89b",
-        }),
-        ("https://hameru-is-cool.tumblr.com/post/639261855227002880", {
-            "count": 2,  # high-quality images (#1344)
-            "content": "6bc19a42787e46e1bba2ef4aeef5ca28fcd3cd34",
-        }),
-        ("https://mikf123.tumblr.com/image/689860196535762944", {
-            "pattern": r"^https://\d+\.media\.tumblr\.com"
-                       r"/134791621559a79793563b636b5fe2c6"
-                       r"/8f1131551cef6e74-bc/s99999x99999"
-                       r"/188cf9b8915b0d0911c6c743d152fc62e8f38491\.png$",
-        }),
-        ("http://ziemniax.tumblr.com/post/109697912859/", {
-            "exception": exception.NotFoundError,  # HTML response (#297)
-        }),
-        ("http://demo.tumblr.com/image/459265350"),
-        ("https://www.tumblr.com/blog/view/smarties-art/686047436641353728"),
-        ("https://www.tumblr.com/blog/smarties-art/686047436641353728"),
-        ("https://www.tumblr.com/smarties-art/686047436641353728"),
-    )
+    example = "https://www.tumblr.com/BLOG/12345"
 
     def __init__(self, match):
         TumblrExtractor.__init__(self, match)
@@ -402,16 +308,7 @@ class TumblrTagExtractor(TumblrExtractor):
     """Extractor for Tumblr user's posts by tag"""
     subcategory = "tag"
     pattern = BASE_PATTERN + r"/tagged/([^/?#]+)"
-    test = (
-        ("http://demo.tumblr.com/tagged/Times%20Square", {
-            "pattern": r"https://\d+\.media\.tumblr\.com"
-                       r"/tumblr_[^/_]+_1280.jpg",
-            "count": 1,
-        }),
-        ("https://www.tumblr.com/blog/view/smarties-art/tagged/undertale"),
-        ("https://www.tumblr.com/blog/smarties-art/tagged/undertale"),
-        ("https://www.tumblr.com/smarties-art/tagged/undertale"),
-    )
+    example = "https://www.tumblr.com/BLOG/tagged/TAG"
 
     def __init__(self, match):
         TumblrExtractor.__init__(self, match)
@@ -425,26 +322,21 @@ class TumblrDayExtractor(TumblrExtractor):
     """Extractor for Tumblr user's posts by day"""
     subcategory = "day"
     pattern = BASE_PATTERN + r"/day/(\d\d\d\d/\d\d/\d\d)"
-    test = (
-        ("https://mikf123.tumblr.com/day/2018/01/05", {
-            "pattern": r"https://64\.media\.tumblr\.com"
-                       r"/1a2be8c63f1df58abd2622861696c72a"
-                       r"/tumblr_ozm9nqst9t1wgha4yo1_1280\.jpg",
-            "keyword": {"id": 169341068404},
-            "count": 1,
-        }),
-        ("https://www.tumblr.com/blog/view/mikf123/day/2018/01/05"),
-        ("https://www.tumblr.com/blog/mikf123/day/2018/01/05"),
-        ("https://www.tumblr.com/mikf123/day/2018/01/05"),
-    )
+    example = "https://www.tumblr.com/BLOG/day/1970/01/01"
 
     def __init__(self, match):
         TumblrExtractor.__init__(self, match)
         year, month, day = match.group(4).split("/")
-        self.date_min = ts = (
+        self.ordinal = date(int(year), int(month), int(day)).toordinal()
+
+    def _init(self):
+        TumblrExtractor._init(self)
+
+        self.date_min = (
             # 719163 == date(1970, 1, 1).toordinal()
-            date(int(year), int(month), int(day)).toordinal() - 719163) * 86400
-        self.api.before = ts + 86400
+            (self.ordinal - 719163) * 86400)
+
+        self.api.before = self.date_min + 86400
 
     def posts(self):
         return self.api.posts(self.blog, {})
@@ -456,17 +348,23 @@ class TumblrLikesExtractor(TumblrExtractor):
     directory_fmt = ("{category}", "{blog_name}", "likes")
     archive_fmt = "f_{blog[name]}_{id}_{num}"
     pattern = BASE_PATTERN + r"/likes"
-    test = (
-        ("http://mikf123.tumblr.com/likes", {
-            "count": 1,
-        }),
-        ("https://www.tumblr.com/blog/view/mikf123/likes"),
-        ("https://www.tumblr.com/blog/mikf123/likes"),
-        ("https://www.tumblr.com/mikf123/likes"),
-    )
+    example = "https://www.tumblr.com/BLOG/likes"
 
     def posts(self):
         return self.api.likes(self.blog)
+
+
+class TumblrSearchExtractor(TumblrExtractor):
+    """Extractor for a Tumblr search"""
+    subcategory = "search"
+    pattern = (BASE_PATTERN + r"/search/([^/?#]+)"
+               r"(?:/([^/?#]+)(?:/([^/?#]+))?)?(?:/?\?([^#]+))?")
+    example = "https://www.tumblr.com/search/QUERY"
+
+    def posts(self):
+        _, _, _, search, mode, post_type, query = self.groups
+        params = text.parse_query(query)
+        return self.api.search(text.unquote(search), params, mode, post_type)
 
 
 class TumblrAPI(oauth.OAuth1API):
@@ -506,7 +404,7 @@ class TumblrAPI(oauth.OAuth1API):
     def posts(self, blog, params):
         """Retrieve published posts"""
         params["offset"] = self.extractor.config("offset")
-        params["limit"] = "50"
+        params["limit"] = 50
         params["reblog_info"] = "true"
         params["type"] = self.posts_type
         params["before"] = self.before
@@ -514,96 +412,151 @@ class TumblrAPI(oauth.OAuth1API):
         if self.before and params["offset"]:
             self.log.warning("'offset' and 'date-max' cannot be used together")
 
-        return self._pagination(blog, "/posts", params, cache=True)
+        endpoint = "/v2/blog/{}/posts".format(blog)
+        return self._pagination(endpoint, params, blog=blog, cache=True)
 
     def likes(self, blog):
         """Retrieve liked posts"""
+        endpoint = "/v2/blog/{}/likes".format(blog)
         params = {"limit": "50", "before": self.before}
-        return self._pagination(blog, "/likes", params, key="liked_posts")
-
-    def _call(self, endpoint, params, **kwargs):
-        url = self.ROOT + endpoint
-        kwargs["params"] = params
-        response = self.request(url, **kwargs)
-
-        try:
-            data = response.json()
-        except ValueError:
-            data = response.text
-            status = response.status_code
-        else:
-            status = data["meta"]["status"]
-            if 200 <= status < 400:
-                return data["response"]
-
-        self.log.debug(data)
-        if status == 403:
-            raise exception.AuthorizationError()
-
-        elif status == 404:
-            try:
-                error = data["errors"][0]["detail"]
-                board = ("only viewable within the Tumblr dashboard" in error)
-            except Exception:
-                board = False
-
-            if board:
-                self.log.info("Run 'gallery-dl oauth:tumblr' "
-                              "to access dashboard-only blogs")
-                raise exception.AuthorizationError(error)
-            raise exception.NotFoundError("user or post")
-
-        elif status == 429:
-            # daily rate limit
-            if response.headers.get("x-ratelimit-perday-remaining") == "0":
-                self.log.info("Daily API rate limit exceeded")
-                reset = response.headers.get("x-ratelimit-perday-reset")
-
-                api_key = self.api_key or self.session.auth.consumer_key
-                if api_key == self.API_KEY:
-                    self.log.info("Register your own OAuth application and "
-                                  "use its credentials to prevent this error: "
-                                  "https://github.com/mikf/gallery-dl/blob/mas"
-                                  "ter/docs/configuration.rst#extractortumblra"
-                                  "pi-key--api-secret")
-
-                if self.extractor.config("ratelimit") == "wait":
-                    self.extractor.wait(seconds=reset)
-                    return self._call(endpoint, params, **kwargs)
-
-                t = (datetime.now() + timedelta(seconds=float(reset))).time()
-                raise exception.StopExtraction(
-                    "Aborting - Rate limit will reset at %s",
-                    "{:02}:{:02}:{:02}".format(t.hour, t.minute, t.second))
-
-            # hourly rate limit
-            reset = response.headers.get("x-ratelimit-perhour-reset")
-            if reset:
-                self.log.info("Hourly API rate limit exceeded")
-                self.extractor.wait(seconds=reset)
-                return self._call(endpoint, params, **kwargs)
-
-        raise exception.StopExtraction(data)
-
-    def _pagination(self, blog, endpoint, params, key="posts", cache=False):
-        endpoint = "/v2/blog/{}{}".format(blog, endpoint)
         if self.api_key:
             params["api_key"] = self.api_key
 
         while True:
-            data = self._call(endpoint, params)
+            posts = self._call(endpoint, params)["liked_posts"]
+            if not posts:
+                return
+            yield from posts
+            params["before"] = posts[-1]["liked_timestamp"]
 
-            if cache:
-                self.BLOG_CACHE[blog] = data["blog"]
-                cache = False
+    def search(self, query, params, mode="top", post_type=None):
+        """Retrieve search results"""
+        endpoint = "/v2/timeline/search"
 
-            yield from data[key]
+        params["limit"] = "50"
+        params["days"] = params.pop("t", None)
+        params["query"] = query
+        params["mode"] = mode
+        params["reblog_info"] = "true" if self.extractor.reblogs else "false"
+        if post_type:
+            params["post_type_filter"] = post_type
+
+        return self._pagination(endpoint, params)
+
+    def _call(self, endpoint, params, **kwargs):
+        url = self.ROOT + endpoint
+        kwargs["params"] = params
+
+        while True:
+            response = self.request(url, **kwargs)
 
             try:
-                endpoint = data["_links"]["next"]["href"]
-            except KeyError:
-                return
+                data = response.json()
+            except ValueError:
+                data = response.text
+                status = response.status_code
+            else:
+                status = data["meta"]["status"]
+                if 200 <= status < 400:
+                    return data["response"]
 
-            params = None
-            if self.api_key:
-                endpoint += "&api_key=" + self.api_key
+            self.log.debug(data)
+
+            if status == 403:
+                raise exception.AuthorizationError()
+
+            elif status == 404:
+                try:
+                    error = data["errors"][0]["detail"]
+                    board = ("only viewable within the Tumblr dashboard"
+                             in error)
+                except Exception:
+                    board = False
+
+                if board:
+                    self.log.info("Run 'gallery-dl oauth:tumblr' "
+                                  "to access dashboard-only blogs")
+                    raise exception.AuthorizationError(error)
+                raise exception.NotFoundError("user or post")
+
+            elif status == 429:
+                # daily rate limit
+                if response.headers.get("x-ratelimit-perday-remaining") == "0":
+                    self.log.info("Daily API rate limit exceeded")
+                    reset = response.headers.get("x-ratelimit-perday-reset")
+
+                    api_key = self.api_key or self.session.auth.consumer_key
+                    if api_key == self.API_KEY:
+                        self.log.info(
+                            "Register your own OAuth application and use its "
+                            "credentials to prevent this error: "
+                            "https://gdl-org.github.io/docs/configuration.html"
+                            "#extractor-tumblr-api-key-api-secret")
+
+                    if self.extractor.config("ratelimit") == "wait":
+                        self.extractor.wait(seconds=reset)
+                        continue
+
+                    t = (datetime.now() + timedelta(0, float(reset))).time()
+                    raise exception.StopExtraction(
+                        "Aborting - Rate limit will reset at %s",
+                        "{:02}:{:02}:{:02}".format(t.hour, t.minute, t.second))
+
+                # hourly rate limit
+                reset = response.headers.get("x-ratelimit-perhour-reset")
+                if reset:
+                    self.log.info("Hourly API rate limit exceeded")
+                    self.extractor.wait(seconds=reset)
+                    continue
+
+            raise exception.StopExtraction(data)
+
+    def _pagination(self, endpoint, params,
+                    blog=None, key="posts", cache=False):
+        if self.api_key:
+            params["api_key"] = self.api_key
+
+        strategy = self.extractor.config("pagination")
+        if not strategy and "offset" not in params:
+            strategy = "api"
+
+        while True:
+            data = self._call(endpoint, params)
+
+            if "timeline" in data:
+                data = data["timeline"]
+                posts = data["elements"]
+
+            else:
+                if cache:
+                    self.BLOG_CACHE[blog] = data["blog"]
+                    cache = False
+                posts = data[key]
+
+            yield from posts
+
+            if strategy == "api":
+                try:
+                    endpoint = data["_links"]["next"]["href"]
+                except KeyError:
+                    return
+
+                params = None
+                if self.api_key:
+                    endpoint += "&api_key=" + self.api_key
+
+            elif strategy == "before":
+                if not posts:
+                    return
+                timestamp = posts[-1]["timestamp"] + 1
+                if params["before"] and timestamp >= params["before"]:
+                    return
+                params["before"] = timestamp
+                params["offset"] = None
+
+            else:  # offset
+                params["offset"] = \
+                    text.parse_int(params["offset"]) + params["limit"]
+                params["before"] = None
+                if params["offset"] >= data["total_posts"]:
+                    return

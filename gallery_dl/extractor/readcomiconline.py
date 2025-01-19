@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2016-2022 Mike Fährmann
+# Copyright 2016-2023 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -23,7 +23,7 @@ class ReadcomiconlineBase():
     filename_fmt = "{comic}_{issue:>03}_{page:>03}.{extension}"
     archive_fmt = "{issue_id}_{page}"
     root = "https://readcomiconline.li"
-    request_interval = (3.0, 7.0)
+    request_interval = (3.0, 6.0)
 
     def request(self, url, **kwargs):
         """Detect and handle redirects to CAPTCHA pages"""
@@ -35,10 +35,7 @@ class ReadcomiconlineBase():
                 self.log.warning(
                     "Redirect to \n%s\nVisit this URL in your browser, solve "
                     "the CAPTCHA, and press ENTER to continue", response.url)
-                try:
-                    input()
-                except (EOFError, OSError):
-                    pass
+                self.input()
             else:
                 raise exception.StopExtraction(
                     "Redirect to \n%s\nVisit this URL in your browser and "
@@ -49,16 +46,14 @@ class ReadcomiconlineIssueExtractor(ReadcomiconlineBase, ChapterExtractor):
     """Extractor for comic-issues from readcomiconline.li"""
     subcategory = "issue"
     pattern = BASE_PATTERN + r"(/Comic/[^/?#]+/[^/?#]+\?)([^#]+)"
-    test = ("https://readcomiconline.li/Comic/W-i-t-c-h/Issue-130?id=22289", {
-        "pattern": r"https://2\.bp\.blogspot\.com/[\w-]+=s0\?.+",
-        "keyword": "2d9ec81ce1b11fac06ebf96ce33cdbfca0e85eb5",
-        "count": 36,
-    })
+    example = "https://readcomiconline.li/Comic/TITLE/Issue-123?id=12345"
 
     def __init__(self, match):
         ChapterExtractor.__init__(self, match)
+        self.params = match.group(2)
 
-        params = text.parse_query(match.group(2))
+    def _init(self):
+        params = text.parse_query(self.params)
         quality = self.config("quality")
 
         if quality is None or quality == "auto":
@@ -83,12 +78,25 @@ class ReadcomiconlineIssueExtractor(ReadcomiconlineBase, ChapterExtractor):
         }
 
     def images(self, page):
-        return [
-            (beau(url), None)
-            for url in text.extract_iter(
-                page, "lstImages.push('", "'",
-            )
-        ]
+        results = []
+        referer = {"_http_headers": {"Referer": self.gallery_url}}
+        root = text.extr(page, "return baeu(l, '", "'")
+
+        replacements = re.findall(
+            r"l = l\.replace\(/([^/]+)/g, [\"']([^\"']*)", page)
+
+        for block in page.split("    pth = '")[1:]:
+            pth = text.extr(block, "", "'")
+
+            for needle, repl in re.findall(
+                    r"pth = pth\.replace\(/([^/]+)/g, [\"']([^\"']*)", block):
+                pth = pth.replace(needle, repl)
+            for needle, repl in replacements:
+                pth = pth.replace(needle, repl)
+
+            results.append((baeu(pth, root), referer))
+
+        return results
 
 
 class ReadcomiconlineComicExtractor(ReadcomiconlineBase, MangaExtractor):
@@ -96,16 +104,7 @@ class ReadcomiconlineComicExtractor(ReadcomiconlineBase, MangaExtractor):
     chapterclass = ReadcomiconlineIssueExtractor
     subcategory = "comic"
     pattern = BASE_PATTERN + r"(/Comic/[^/?#]+/?)$"
-    test = (
-        ("https://readcomiconline.li/Comic/W-i-t-c-h", {
-            "url": "74eb8b9504b4084fcc9367b341300b2c52260918",
-            "keyword": "3986248e4458fa44a201ec073c3684917f48ee0c",
-        }),
-        ("https://readcomiconline.to/Comic/Bazooka-Jules", {
-            "url": "2f66a467a772df4d4592e97a059ddbc3e8991799",
-            "keyword": "f5ba5246cd787bb750924d9690cb1549199bd516",
-        }),
-    )
+    example = "https://readcomiconline.li/Comic/TITLE"
 
     def chapters(self, page):
         results = []
@@ -129,20 +128,24 @@ class ReadcomiconlineComicExtractor(ReadcomiconlineBase, MangaExtractor):
         return results
 
 
-def beau(url):
+def baeu(url, root="", root_blogspot="https://2.bp.blogspot.com"):
     """https://readcomiconline.li/Scripts/rguard.min.js"""
-    url = url.replace("_x236", "d")
-    url = url.replace("_x945", "g")
+    if not root:
+        root = root_blogspot
+
+    url = url.replace("pw_.g28x", "b")
+    url = url.replace("d2pr.x_27", "h")
 
     if url.startswith("https"):
-        return url
+        return url.replace(root_blogspot, root, 1)
 
-    url, sep, rest = url.partition("?")
-    containsS0 = "=s0" in url
-    url = url[:-3 if containsS0 else -6]
-    url = url[4:22] + url[25:]
-    url = url[0:-6] + url[-2:]
-    url = binascii.a2b_base64(url).decode()
-    url = url[0:13] + url[17:]
-    url = url[0:-2] + ("=s0" if containsS0 else "=s1600")
-    return "https://2.bp.blogspot.com/" + url + sep + rest
+    path, sep, query = url.partition("?")
+
+    contains_s0 = "=s0" in path
+    path = path[:-3 if contains_s0 else -6]
+    path = path[15:33] + path[50:]  # step1()
+    path = path[0:-11] + path[-2:]  # step2()
+    path = binascii.a2b_base64(path).decode()  # atob()
+    path = path[0:13] + path[17:]
+    path = path[0:-2] + ("=s0" if contains_s0 else "=s1600")
+    return root + "/" + path + sep + query

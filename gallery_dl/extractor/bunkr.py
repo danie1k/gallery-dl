@@ -6,95 +6,203 @@
 # it under the terms of the GNU General Public License version 2 as
 # published by the Free Software Foundation.
 
-"""Extractors for https://bunkr.la/"""
+"""Extractors for https://bunkr.si/"""
 
+from .common import Extractor
 from .lolisafe import LolisafeAlbumExtractor
-from .. import text
+from .. import text, config, exception
+import random
+
+if config.get(("extractor", "bunkr"), "tlds"):
+    BASE_PATTERN = (
+        r"(?:bunkr:(?:https?://)?([^/?#]+)|"
+        r"(?:https?://)?(?:app\.)?(bunkr+\.\w+))"
+    )
+else:
+    BASE_PATTERN = (
+        r"(?:bunkr:(?:https?://)?([^/?#]+)|"
+        r"(?:https?://)?(?:app\.)?(bunkr+"
+        r"\.(?:s[kiu]|c[ir]|fi|p[hks]|ru|la|is|to|a[cx]"
+        r"|black|cat|media|red|site|ws|org)))"
+    )
+
+DOMAINS = [
+    "bunkr.ac",
+    "bunkr.ci",
+    "bunkr.cr",
+    "bunkr.fi",
+    "bunkr.ph",
+    "bunkr.pk",
+    "bunkr.ps",
+    "bunkr.si",
+    "bunkr.sk",
+    "bunkr.ws",
+    "bunkr.black",
+    "bunkr.red",
+    "bunkr.media",
+    "bunkr.site",
+]
+LEGACY_DOMAINS = {
+    "bunkr.ax",
+    "bunkr.cat",
+    "bunkr.ru",
+    "bunkrr.ru",
+    "bunkr.su",
+    "bunkrr.su",
+    "bunkr.la",
+    "bunkr.is",
+    "bunkr.to",
+}
+CF_DOMAINS = set()
 
 
 class BunkrAlbumExtractor(LolisafeAlbumExtractor):
-    """Extractor for bunkr.la albums"""
+    """Extractor for bunkr.si albums"""
     category = "bunkr"
-    root = "https://bunkr.la"
-    pattern = r"(?:https?://)?(?:app\.)?bunkr\.(?:la|[sr]u|is|to)/a/([^/?#]+)"
-    test = (
-        ("https://bunkr.la/a/Lktg9Keq", {
-            "pattern": r"https://cdn\.bunkr\.ru/test-テスト-\"&>-QjgneIQv\.png",
-            "content": "0c8768055e4e20e7c7259608b67799171b691140",
-            "keyword": {
-                "album_id": "Lktg9Keq",
-                "album_name": 'test テスト "&>',
-                "count": 1,
-                "filename": 'test-テスト-"&>-QjgneIQv',
-                "id": "QjgneIQv",
-                "name": 'test-テスト-"&>',
-                "num": int,
-            },
-        }),
-        # mp4 (#2239)
-        ("https://app.bunkr.ru/a/ptRHaCn2", {
-            "pattern": r"https://media-files\.bunkr\.ru/_-RnHoW69L\.mp4",
-            "content": "80e61d1dbc5896ae7ef9a28734c747b28b320471",
-        }),
-        # cdn4
-        ("https://bunkr.is/a/iXTTc1o2", {
-            "pattern": r"https://(cdn|media-files)4\.bunkr\.ru/",
-            "content": "da29aae371b7adc8c5ef8e6991b66b69823791e8",
-            "keyword": {
-                "album_id": "iXTTc1o2",
-                "album_name": "test2",
-                "album_size": "691.1 KB",
-                "count": 2,
-                "description": "072022",
-                "filename": "re:video-wFO9FtxG|image-sZrQUeOx",
-                "id": "re:wFO9FtxG|sZrQUeOx",
-                "name": "re:video|image",
-                "num": int,
-            },
-        }),
-        ("https://bunkr.la/a/Lktg9Keq"),
-        ("https://bunkr.su/a/Lktg9Keq"),
-        ("https://bunkr.ru/a/Lktg9Keq"),
-        ("https://bunkr.is/a/Lktg9Keq"),
-        ("https://bunkr.to/a/Lktg9Keq"),
-    )
+    root = "https://bunkr.si"
+    pattern = BASE_PATTERN + r"/a/([^/?#]+)"
+    example = "https://bunkr.si/a/ID"
+
+    def __init__(self, match):
+        LolisafeAlbumExtractor.__init__(self, match)
+        domain = self.groups[0] or self.groups[1]
+        if domain not in LEGACY_DOMAINS:
+            self.root = "https://" + domain
+
+    def request(self, url, **kwargs):
+        kwargs["encoding"] = "utf-8"
+        kwargs["allow_redirects"] = False
+
+        while True:
+            try:
+                response = Extractor.request(self, url, **kwargs)
+                if response.status_code < 300:
+                    return response
+
+                # redirect
+                url = response.headers["Location"]
+                if url[0] == "/":
+                    url = self.root + url
+                    continue
+                root, path = self._split(url)
+                if root not in CF_DOMAINS:
+                    continue
+                self.log.debug("Redirect to known CF challenge domain '%s'",
+                               root)
+
+            except exception.HttpError as exc:
+                if exc.status != 403:
+                    raise
+
+                # CF challenge
+                root, path = self._split(url)
+                CF_DOMAINS.add(root)
+                self.log.debug("Added '%s' to CF challenge domains", root)
+
+                try:
+                    DOMAINS.remove(root.rpartition("/")[2])
+                except ValueError:
+                    pass
+                else:
+                    if not DOMAINS:
+                        raise exception.StopExtraction(
+                            "All Bunkr domains require solving a CF challenge")
+
+            # select alternative domain
+            self.root = root = "https://" + random.choice(DOMAINS)
+            self.log.debug("Trying '%s' as fallback", root)
+            url = root + path
 
     def fetch_album(self, album_id):
         # album metadata
-        page = self.request(self.root + "/a/" + self.album_id).text
-        info = text.split_html(text.extr(
-            page, "<h1", "</div>").partition(">")[2])
-        count, _, size = info[1].split(None, 2)
+        page = self.request(self.root + "/a/" + album_id).text
+        title = text.unescape(text.unescape(text.extr(
+            page, 'property="og:title" content="', '"')))
 
         # files
-        cdn = None
-        files = []
-        append = files.append
-        headers = {"Referer": self.root.replace("://", "://stream.", 1) + "/"}
+        items = list(text.extract_iter(
+            page, '<div class="grid-images_box', "</a>"))
 
-        pos = page.index('class="grid-images')
-        for url in text.extract_iter(page, '<a href="', '"', pos):
-            if url.startswith("/"):
-                if not cdn:
-                    # fetch cdn root from download page
-                    durl = "{}/d/{}".format(self.root, url[3:])
-                    cdn = text.extr(self.request(
-                        durl).text, 'link.href = "', '"')
-                    cdn = cdn[:cdn.index("/", 8)]
-                url = cdn + url[2:]
+        return self._extract_files(items), {
+            "album_id"   : album_id,
+            "album_name" : title,
+            "album_size" : text.extr(
+                page, '<span class="font-semibold">(', ')'),
+            "count"      : len(items),
+        }
 
-            url = text.unescape(url)
-            if url.endswith((".mp4", ".m4v", ".mov", ".webm", ".mkv", ".ts",
-                             ".zip", ".rar", ".7z")):
-                append({"file": url.replace("://cdn", "://media-files", 1),
-                        "_http_headers": headers})
-            else:
-                append({"file": url})
+    def _extract_files(self, items):
+        for item in items:
+            try:
+                url = text.unescape(text.extr(item, ' href="', '"'))
+                if url[0] == "/":
+                    url = self.root + url
 
-        return files, {
-            "album_id"   : self.album_id,
-            "album_name" : text.unescape(info[0]),
-            "album_size" : size[1:-1],
-            "description": text.unescape(info[2]) if len(info) > 2 else "",
-            "count"      : len(files),
+                file = self._extract_file(url)
+                info = text.split_html(item)
+                if not file["name"]:
+                    file["name"] = info[-3]
+                file["size"] = info[-2]
+                file["date"] = text.parse_datetime(
+                    info[-1], "%H:%M:%S %d/%m/%Y")
+
+                yield file
+            except exception.StopExtraction:
+                raise
+            except Exception as exc:
+                self.log.error("%s: %s", exc.__class__.__name__, exc)
+                self.log.debug("", exc_info=exc)
+
+    def _extract_file(self, webpage_url):
+        response = self.request(webpage_url)
+        page = response.text
+        file_url = (text.extr(page, '<source src="', '"') or
+                    text.extr(page, '<img src="', '"'))
+        file_name = (text.extr(page, 'property="og:title" content="', '"') or
+                     text.extr(page, "<title>", " | Bunkr<"))
+
+        if not file_url:
+            webpage_url = text.unescape(text.rextract(
+                page, ' href="', '"', page.rindex("Download"))[0])
+            response = self.request(webpage_url)
+            file_url = text.rextract(response.text, ' href="', '"')[0]
+
+        return {
+            "file"          : text.unescape(file_url),
+            "name"          : text.unescape(file_name),
+            "_http_headers" : {"Referer": response.url},
+            "_http_validate": self._validate,
+        }
+
+    def _validate(self, response):
+        if response.history and response.url.endswith("/maintenance-vid.mp4"):
+            self.log.warning("File server in maintenance mode")
+            return False
+        return True
+
+    def _split(self, url):
+        pos = url.index("/", 8)
+        return url[:pos], url[pos:]
+
+
+class BunkrMediaExtractor(BunkrAlbumExtractor):
+    """Extractor for bunkr.si media links"""
+    subcategory = "media"
+    directory_fmt = ("{category}",)
+    pattern = BASE_PATTERN + r"(/[fvid]/[^/?#]+)"
+    example = "https://bunkr.si/f/FILENAME"
+
+    def fetch_album(self, album_id):
+        try:
+            file = self._extract_file(self.root + album_id)
+        except Exception as exc:
+            self.log.error("%s: %s", exc.__class__.__name__, exc)
+            return (), {}
+
+        return (file,), {
+            "album_id"   : "",
+            "album_name" : "",
+            "album_size" : -1,
+            "description": "",
+            "count"      : 1,
         }

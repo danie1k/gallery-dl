@@ -19,14 +19,16 @@ class MastodonExtractor(BaseExtractor):
     directory_fmt = ("mastodon", "{instance}", "{account[username]}")
     filename_fmt = "{category}_{id}_{media[id]}.{extension}"
     archive_fmt = "{media[id]}"
-    cookiedomain = None
 
     def __init__(self, match):
         BaseExtractor.__init__(self, match)
-        self.instance = self.root.partition("://")[2]
         self.item = match.group(match.lastindex)
+
+    def _init(self):
+        self.instance = self.root.partition("://")[2]
         self.reblogs = self.config("reblogs", False)
         self.replies = self.config("replies", True)
+        self.cards = self.config("cards", False)
 
     def items(self):
         for status in self.statuses():
@@ -42,6 +44,20 @@ class MastodonExtractor(BaseExtractor):
 
             attachments = status["media_attachments"]
             del status["media_attachments"]
+
+            if status["reblog"]:
+                attachments.extend(status["reblog"]["media_attachments"])
+
+            if self.cards:
+                card = status.get("card")
+                if card:
+                    url = card.get("image")
+                    if url:
+                        card["weburl"] = card.get("url")
+                        card["url"] = url
+                        card["id"] = "card" + "".join(
+                            url.split("/")[6:-2]).lstrip("0")
+                        attachments.append(card)
 
             status["instance"] = self.instance
             acct = status["account"]["acct"]
@@ -65,12 +81,16 @@ class MastodonExtractor(BaseExtractor):
 
     def _check_moved(self, account):
         self._check_moved = None
-        if "moved" in account:
+        # Certain fediverse software (such as Iceshrimp and Sharkey) have a
+        # null account "moved" field instead of not having it outright.
+        # To handle this, check if the "moved" value is truthy instead
+        # if only it exists.
+        if account.get("moved"):
             self.log.warning("Account '%s' moved to '%s'",
                              account["acct"], account["moved"]["acct"])
 
 
-INSTANCES = {
+BASE_PATTERN = MastodonExtractor.update({
     "mastodon.social": {
         "root"         : "https://mastodon.social",
         "pattern"      : r"mastodon\.social",
@@ -95,45 +115,25 @@ INSTANCES = {
         "client-id"    : "czxx2qilLElYHQ_sm-lO8yXuGwOHxLX9RYYaD0-nq1o",
         "client-secret": "haMaFdMBgK_-BIxufakmI2gFgkYjqmgXGEO2tB-R2xY",
     }
-}
-
-BASE_PATTERN = MastodonExtractor.update(INSTANCES) + "(?:/web)?"
+}) + "(?:/web)?"
 
 
 class MastodonUserExtractor(MastodonExtractor):
     """Extractor for all images of an account/user"""
     subcategory = "user"
     pattern = BASE_PATTERN + r"/(?:@|users/)([^/?#]+)(?:/media)?/?$"
-    test = (
-        ("https://mastodon.social/@jk", {
-            "pattern": r"https://files.mastodon.social/media_attachments"
-                       r"/files/(\d+/){3,}original/\w+",
-            "range": "1-60",
-            "count": 60,
-        }),
-        ("https://pawoo.net/@yoru_nine/", {
-            "range": "1-60",
-            "count": 60,
-        }),
-        ("https://baraag.net/@pumpkinnsfw"),
-        ("https://mastodon.social/@yoru_nine@pawoo.net", {
-            "pattern": r"https://mastodon\.social/media_proxy/\d+/original",
-            "range": "1-10",
-            "count": 10,
-        }),
-        ("https://mastodon.social/@id:10843"),
-        ("https://mastodon.social/users/id:10843"),
-        ("https://mastodon.social/users/jk"),
-        ("https://mastodon.social/users/yoru_nine@pawoo.net"),
-        ("https://mastodon.social/web/@jk"),
-    )
+    example = "https://mastodon.social/@USER"
 
     def statuses(self):
         api = MastodonAPI(self)
 
         return api.account_statuses(
             api.account_id_by_username(self.item),
-            only_media=not self.config("text-posts", False),
+            only_media=(
+                not self.reblogs and
+                not self.cards and
+                not self.config("text-posts", False)
+            ),
             exclude_replies=not self.replies,
         )
 
@@ -142,29 +142,47 @@ class MastodonBookmarkExtractor(MastodonExtractor):
     """Extractor for mastodon bookmarks"""
     subcategory = "bookmark"
     pattern = BASE_PATTERN + r"/bookmarks"
-    test = (
-        ("https://mastodon.social/bookmarks"),
-        ("https://pawoo.net/bookmarks"),
-        ("https://baraag.net/bookmarks"),
-    )
+    example = "https://mastodon.social/bookmarks"
 
     def statuses(self):
         return MastodonAPI(self).account_bookmarks()
 
 
+class MastodonFavoriteExtractor(MastodonExtractor):
+    """Extractor for mastodon favorites"""
+    subcategory = "favorite"
+    pattern = BASE_PATTERN + r"/favourites"
+    example = "https://mastodon.social/favourites"
+
+    def statuses(self):
+        return MastodonAPI(self).account_favorites()
+
+
+class MastodonListExtractor(MastodonExtractor):
+    """Extractor for mastodon lists"""
+    subcategory = "list"
+    pattern = BASE_PATTERN + r"/lists/(\w+)"
+    example = "https://mastodon.social/lists/12345"
+
+    def statuses(self):
+        return MastodonAPI(self).timelines_list(self.item)
+
+
+class MastodonHashtagExtractor(MastodonExtractor):
+    """Extractor for mastodon hashtags"""
+    subcategory = "hashtag"
+    pattern = BASE_PATTERN + r"/tags/(\w+)"
+    example = "https://mastodon.social/tags/NAME"
+
+    def statuses(self):
+        return MastodonAPI(self).timelines_tag(self.item)
+
+
 class MastodonFollowingExtractor(MastodonExtractor):
     """Extractor for followed mastodon users"""
     subcategory = "following"
-    pattern = BASE_PATTERN + r"/users/([^/?#]+)/following"
-    test = (
-        ("https://mastodon.social/users/0x4f/following", {
-            "extractor": False,
-            "count": ">= 20",
-        }),
-        ("https://mastodon.social/users/id:10843/following"),
-        ("https://pawoo.net/users/yoru_nine/following"),
-        ("https://baraag.net/users/pumpkinnsfw/following"),
-    )
+    pattern = BASE_PATTERN + r"/(?:@|users/)([^/?#]+)/following"
+    example = "https://mastodon.social/@USER/following"
 
     def items(self):
         api = MastodonAPI(self)
@@ -178,22 +196,8 @@ class MastodonFollowingExtractor(MastodonExtractor):
 class MastodonStatusExtractor(MastodonExtractor):
     """Extractor for images from a status"""
     subcategory = "status"
-    pattern = BASE_PATTERN + r"/@[^/?#]+/(\d+)"
-    test = (
-        ("https://mastodon.social/@jk/103794036899778366", {
-            "count": 4,
-            "keyword": {
-                "count": 4,
-                "num": int,
-            },
-        }),
-        ("https://pawoo.net/@yoru_nine/105038878897832922", {
-            "content": "b52e807f8ab548d6f896b09218ece01eba83987a",
-        }),
-        ("https://baraag.net/@pumpkinnsfw/104364170556898443", {
-            "content": "67748c1b828c58ad60d0fe5729b59fb29c872244",
-        }),
-    )
+    pattern = BASE_PATTERN + r"/@[^/?#]+/(?!following)([^/?#]+)"
+    example = "https://mastodon.social/@USER/12345"
 
     def statuses(self):
         return (MastodonAPI(self).status(self.item),)
@@ -214,10 +218,8 @@ class MastodonAPI():
         if access_token is None or access_token == "cache":
             access_token = _access_token_cache(extractor.instance)
         if not access_token:
-            try:
-                access_token = INSTANCES[extractor.category]["access-token"]
-            except (KeyError, TypeError):
-                pass
+            access_token = extractor.config_instance("access-token")
+
         if access_token:
             self.headers = {"Authorization": "Bearer " + access_token}
         else:
@@ -245,36 +247,54 @@ class MastodonAPI():
         raise exception.NotFoundError("account")
 
     def account_bookmarks(self):
+        """Statuses the user has bookmarked"""
         endpoint = "/v1/bookmarks"
         return self._pagination(endpoint, None)
 
+    def account_favorites(self):
+        """Statuses the user has favourited"""
+        endpoint = "/v1/favourites"
+        return self._pagination(endpoint, None)
+
     def account_following(self, account_id):
+        """Accounts which the given account is following"""
         endpoint = "/v1/accounts/{}/following".format(account_id)
         return self._pagination(endpoint, None)
 
     def account_lookup(self, username):
+        """Quickly lookup a username to see if it is available"""
         endpoint = "/v1/accounts/lookup"
         params = {"acct": username}
         return self._call(endpoint, params).json()
 
     def account_search(self, query, limit=40):
-        """Search for accounts"""
+        """Search for matching accounts by username or display name"""
         endpoint = "/v1/accounts/search"
         params = {"q": query, "limit": limit}
         return self._call(endpoint, params).json()
 
     def account_statuses(self, account_id, only_media=True,
                          exclude_replies=False):
-        """Fetch an account's statuses"""
+        """Statuses posted to the given account"""
         endpoint = "/v1/accounts/{}/statuses".format(account_id)
-        params = {"only_media"     : "1" if only_media else "0",
-                  "exclude_replies": "1" if exclude_replies else "0"}
+        params = {"only_media"     : "true" if only_media else "false",
+                  "exclude_replies": "true" if exclude_replies else "false"}
         return self._pagination(endpoint, params)
 
     def status(self, status_id):
-        """Fetch a status"""
+        """Obtain information about a status"""
         endpoint = "/v1/statuses/" + status_id
         return self._call(endpoint).json()
+
+    def timelines_list(self, list_id):
+        """View statuses in the given list timeline"""
+        endpoint = "/v1/timelines/list/" + list_id
+        return self._pagination(endpoint, None)
+
+    def timelines_tag(self, hashtag):
+        """View public statuses containing the given hashtag"""
+        endpoint = "/v1/timelines/tag/" + hashtag
+        return self._pagination(endpoint, None)
 
     def _call(self, endpoint, params=None):
         if endpoint.startswith("http"):
@@ -317,6 +337,6 @@ class MastodonAPI():
             params = None
 
 
-@cache(maxage=100*365*24*3600, keyarg=0)
+@cache(maxage=36500*86400, keyarg=0)
 def _access_token_cache(instance):
     return None

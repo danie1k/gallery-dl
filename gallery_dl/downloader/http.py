@@ -13,12 +13,7 @@ import mimetypes
 from requests.exceptions import RequestException, ConnectionError, Timeout
 from .common import DownloaderBase
 from .. import text, util
-
 from ssl import SSLError
-try:
-    from OpenSSL.SSL import Error as OpenSSLError
-except ImportError:
-    OpenSSLError = SSLError
 
 
 class HttpDownloader(DownloaderBase):
@@ -103,6 +98,8 @@ class HttpDownloader(DownloaderBase):
 
         metadata = self.metadata
         kwdict = pathfmt.kwdict
+        expected_status = kwdict.get(
+            "_http_expected_status", ())
         adjust_extension = kwdict.get(
             "_http_adjust_extension", self.adjust_extension)
 
@@ -147,7 +144,16 @@ class HttpDownloader(DownloaderBase):
                     proxies=self.proxies,
                     verify=self.verify,
                 )
-            except (ConnectionError, Timeout) as exc:
+            except ConnectionError as exc:
+                try:
+                    reason = exc.args[0].reason
+                    cls = reason.__class__.__name__
+                    pre, _, err = str(reason.args[-1]).partition(":")
+                    msg = "{}: {}".format(cls, (err or pre).lstrip())
+                except Exception:
+                    msg = str(exc)
+                continue
+            except Timeout as exc:
                 msg = str(exc)
                 continue
             except Exception as exc:
@@ -156,7 +162,7 @@ class HttpDownloader(DownloaderBase):
 
             # check response
             code = response.status_code
-            if code == 200:  # OK
+            if code == 200 or code in expected_status:  # OK
                 offset = 0
                 size = response.headers.get("Content-Length")
             elif code == 206:  # Partial Content
@@ -200,13 +206,15 @@ class HttpDownloader(DownloaderBase):
                     self.log.warning(
                         "File size smaller than allowed minimum (%s < %s)",
                         size, self.minsize)
-                    return False
+                    pathfmt.temppath = ""
+                    return True
                 if self.maxsize and size > self.maxsize:
                     self.release_conn(response)
                     self.log.warning(
                         "File size larger than allowed maximum (%s > %s)",
                         size, self.maxsize)
-                    return False
+                    pathfmt.temppath = ""
+                    return True
 
             build_path = False
 
@@ -225,6 +233,14 @@ class HttpDownloader(DownloaderBase):
                 pathfmt.build_path()
                 if pathfmt.exists():
                     pathfmt.temppath = ""
+                    # release the connection back to pool by explicitly
+                    # calling .close()
+                    # see https://requests.readthedocs.io/en/latest/user
+                    # /advanced/#body-content-workflow
+                    # when the image size is on the order of megabytes,
+                    # re-establishing a TLS connection will typically be faster
+                    # than consuming the whole response
+                    response.close()
                     return True
                 if self.part and metadata:
                     pathfmt.part_enable(self.partdir)
@@ -239,13 +255,14 @@ class HttpDownloader(DownloaderBase):
                     file_header = next(
                         content if response.raw.chunked
                         else response.iter_content(16), b"")
-                except (RequestException, SSLError, OpenSSLError) as exc:
+                except (RequestException, SSLError) as exc:
                     msg = str(exc)
                     print()
                     continue
                 if self._adjust_extension(pathfmt, file_header) and \
                         pathfmt.exists():
                     pathfmt.temppath = ""
+                    response.close()
                     return True
 
             # set open mode
@@ -272,7 +289,7 @@ class HttpDownloader(DownloaderBase):
                 self.out.start(pathfmt.path)
                 try:
                     self.receive(fp, content, size, offset)
-                except (RequestException, SSLError, OpenSSLError) as exc:
+                except (RequestException, SSLError) as exc:
                     msg = str(exc)
                     print()
                     continue
@@ -299,7 +316,7 @@ class HttpDownloader(DownloaderBase):
         try:
             for _ in response.iter_content(self.chunk_size):
                 pass
-        except (RequestException, SSLError, OpenSSLError) as exc:
+        except (RequestException, SSLError) as exc:
             print()
             self.log.debug(
                 "Unable to consume response body (%s: %s); "
@@ -393,6 +410,9 @@ MIME_TYPES = {
     "video/webm": "webm",
     "video/ogg" : "ogg",
     "video/mp4" : "mp4",
+    "video/m4v" : "m4v",
+    "video/x-m4v": "m4v",
+    "video/quicktime": "mov",
 
     "audio/wav"  : "wav",
     "audio/x-wav": "wav",
@@ -434,7 +454,9 @@ SIGNATURE_CHECKS = {
     "cur" : lambda s: s[0:4] == b"\x00\x00\x02\x00",
     "psd" : lambda s: s[0:4] == b"8BPS",
     "mp4" : lambda s: (s[4:8] == b"ftyp" and s[8:11] in (
-                       b"mp4", b"avc", b"iso", b"M4V")),
+                       b"mp4", b"avc", b"iso")),
+    "m4v" : lambda s: s[4:11] == b"ftypM4V",
+    "mov" : lambda s: s[4:12] == b"ftypqt  ",
     "webm": lambda s: s[0:4] == b"\x1A\x45\xDF\xA3",
     "ogg" : lambda s: s[0:4] == b"OggS",
     "wav" : lambda s: (s[0:4] == b"RIFF" and

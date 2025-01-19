@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2017-2022 Mike Fährmann
+# Copyright 2017-2023 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -20,12 +20,15 @@ class FlickrExtractor(Extractor):
     filename_fmt = "{category}_{id}.{extension}"
     directory_fmt = ("{category}", "{user[username]}")
     archive_fmt = "{id}"
-    cookiedomain = None
+    request_interval = (1.0, 2.0)
+    request_interval_min = 0.5
 
     def __init__(self, match):
         Extractor.__init__(self, match)
-        self.api = FlickrAPI(self)
         self.item_id = match.group(1)
+
+    def _init(self):
+        self.api = FlickrAPI(self)
         self.user = None
 
     def items(self):
@@ -36,11 +39,12 @@ class FlickrExtractor(Extractor):
                 photo = extract(photo)
             except Exception as exc:
                 self.log.warning(
-                    "Skipping %s (%s)", photo["id"], exc.__class__.__name__)
-                self.log.debug("", exc_info=True)
+                    "Skipping photo %s (%s: %s)",
+                    photo["id"], exc.__class__.__name__, exc)
+                self.log.debug("", exc_info=exc)
             else:
                 photo.update(data)
-                url = photo["url"]
+                url = self._file_url(photo)
                 yield Message.Directory, photo
                 yield Message.Url, url, text.nameext_from_url(url, photo)
 
@@ -52,6 +56,15 @@ class FlickrExtractor(Extractor):
     def photos(self):
         """Return an iterable with all relevant photo objects"""
 
+    def _file_url(self, photo):
+        url = photo["url"]
+
+        if "/video/" in url:
+            return url
+
+        path, _, ext = url.rpartition(".")
+        return path + "_d." + ext
+
 
 class FlickrImageExtractor(FlickrExtractor):
     """Extractor for individual images from flickr.com"""
@@ -60,42 +73,7 @@ class FlickrImageExtractor(FlickrExtractor):
                r"(?:(?:www\.|secure\.|m\.)?flickr\.com/photos/[^/?#]+/"
                r"|[\w-]+\.static\.?flickr\.com/(?:\d+/)+)(\d+)"
                r"|flic\.kr/p/([A-Za-z1-9]+))")
-    test = (
-        ("https://www.flickr.com/photos/departingyyz/16089302239", {
-            "pattern": pattern,
-            "content": ("3133006c6d657fe54cf7d4c46b82abbcb0efaf9f",
-                        "0821a28ee46386e85b02b67cf2720063440a228c"),
-            "keyword": {
-                "comments": int,
-                "description": str,
-                "extension": "jpg",
-                "filename": "16089302239_de18cd8017_b",
-                "id": 16089302239,
-                "height": 683,
-                "label": "Large",
-                "media": "photo",
-                "url": str,
-                "views": int,
-                "width": 1024,
-            },
-        }),
-        ("https://secure.flickr.com/photos/departingyyz/16089302239"),
-        ("https://m.flickr.com/photos/departingyyz/16089302239"),
-        ("https://flickr.com/photos/departingyyz/16089302239"),
-
-        ("https://www.flickr.com/photos/145617051@N08/46733161535", {
-            "count": 1,
-            "keyword": {"media": "video"},
-        }),
-        ("http://c2.staticflickr.com/2/1475/24531000464_9a7503ae68_b.jpg", {
-            "pattern": pattern}),
-        ("https://farm2.static.flickr.com/1035/1188352415_cb139831d0.jpg", {
-            "pattern": pattern}),
-        ("https://flic.kr/p/FPVo9U", {
-            "pattern": pattern}),
-        ("https://www.flickr.com/photos/zzz/16089302238", {
-            "exception": exception.NotFoundError}),
-    )
+    example = "https://www.flickr.com/photos/USER/12345"
 
     def __init__(self, match):
         FlickrExtractor.__init__(self, match)
@@ -107,6 +85,7 @@ class FlickrImageExtractor(FlickrExtractor):
     def items(self):
         photo = self.api.photos_getInfo(self.item_id)
 
+        self.api._extract_metadata(photo)
         if photo["media"] == "video" and self.api.videos:
             self.api._extract_video(photo)
         else:
@@ -127,7 +106,7 @@ class FlickrImageExtractor(FlickrExtractor):
                 if isinstance(value, dict):
                     location[key] = value["_content"]
 
-        url = photo["url"]
+        url = self._file_url(photo)
         yield Message.Directory, photo
         yield Message.Url, url, text.nameext_from_url(url, photo)
 
@@ -139,18 +118,7 @@ class FlickrAlbumExtractor(FlickrExtractor):
                      "Albums", "{album[id]} {album[title]}")
     archive_fmt = "a_{album[id]}_{id}"
     pattern = BASE_PATTERN + r"/photos/([^/?#]+)/(?:album|set)s(?:/(\d+))?"
-    test = (
-        (("https://www.flickr.com/photos/shona_s/albums/72157633471741607"), {
-            "pattern": FlickrImageExtractor.pattern,
-            "count": 6,
-        }),
-        ("https://www.flickr.com/photos/shona_s/albums", {
-            "pattern": pattern,
-            "count": 2,
-        }),
-        ("https://secure.flickr.com/photos/shona_s/albums"),
-        ("https://m.flickr.com/photos/shona_s/albums"),
-    )
+    example = "https://www.flickr.com/photos/USER/albums/12345"
 
     def __init__(self, match):
         FlickrExtractor.__init__(self, match)
@@ -173,8 +141,13 @@ class FlickrAlbumExtractor(FlickrExtractor):
 
     def metadata(self):
         data = FlickrExtractor.metadata(self)
-        data["album"] = self.api.photosets_getInfo(
-            self.album_id, self.user["nsid"])
+        try:
+            data["album"] = self.api.photosets_getInfo(
+                self.album_id, self.user["nsid"])
+        except Exception:
+            data["album"] = {}
+            self.log.warning("%s: Unable to retrieve album metadata",
+                             self.album_id)
         return data
 
     def photos(self):
@@ -188,11 +161,7 @@ class FlickrGalleryExtractor(FlickrExtractor):
                      "Galleries", "{gallery[gallery_id]} {gallery[title]}")
     archive_fmt = "g_{gallery[id]}_{id}"
     pattern = BASE_PATTERN + r"/photos/([^/?#]+)/galleries/(\d+)"
-    test = (("https://www.flickr.com/photos/flickr/"
-             "galleries/72157681572514792/"), {
-        "pattern": FlickrImageExtractor.pattern,
-        "count": ">= 10",
-    })
+    example = "https://www.flickr.com/photos/USER/galleries/12345/"
 
     def __init__(self, match):
         FlickrExtractor.__init__(self, match)
@@ -213,10 +182,7 @@ class FlickrGroupExtractor(FlickrExtractor):
     directory_fmt = ("{category}", "Groups", "{group[groupname]}")
     archive_fmt = "G_{group[nsid]}_{id}"
     pattern = BASE_PATTERN + r"/groups/([^/?#]+)"
-    test = ("https://www.flickr.com/groups/bird_headshots/", {
-        "pattern": FlickrImageExtractor.pattern,
-        "count": "> 150",
-    })
+    example = "https://www.flickr.com/groups/NAME/"
 
     def metadata(self):
         self.group = self.api.urls_lookupGroup(self.item_id)
@@ -231,10 +197,7 @@ class FlickrUserExtractor(FlickrExtractor):
     subcategory = "user"
     archive_fmt = "u_{user[nsid]}_{id}"
     pattern = BASE_PATTERN + r"/photos/([^/?#]+)/?$"
-    test = ("https://www.flickr.com/photos/shona_s/", {
-        "pattern": FlickrImageExtractor.pattern,
-        "count": 28,
-    })
+    example = "https://www.flickr.com/photos/USER/"
 
     def photos(self):
         return self.api.people_getPhotos(self.user["nsid"])
@@ -246,10 +209,7 @@ class FlickrFavoriteExtractor(FlickrExtractor):
     directory_fmt = ("{category}", "{user[username]}", "Favorites")
     archive_fmt = "f_{user[nsid]}_{id}"
     pattern = BASE_PATTERN + r"/photos/([^/?#]+)/favorites"
-    test = ("https://www.flickr.com/photos/shona_s/favorites", {
-        "pattern": FlickrImageExtractor.pattern,
-        "count": 4,
-    })
+    example = "https://www.flickr.com/photos/USER/favorites"
 
     def photos(self):
         return self.api.favorites_getList(self.user["nsid"])
@@ -261,11 +221,7 @@ class FlickrSearchExtractor(FlickrExtractor):
     directory_fmt = ("{category}", "Search", "{search[text]}")
     archive_fmt = "s_{search}_{id}"
     pattern = BASE_PATTERN + r"/search/?\?([^#]+)"
-    test = (
-        ("https://flickr.com/search/?text=mountain"),
-        ("https://flickr.com/search/?text=tree%20cloud%20house"
-         "&color_codes=4&styles=minimalism"),
-    )
+    example = "https://flickr.com/search/?text=QUERY"
 
     def __init__(self, match):
         FlickrExtractor.__init__(self, match)
@@ -287,8 +243,8 @@ class FlickrAPI(oauth.OAuth1API):
     """
 
     API_URL = "https://api.flickr.com/services/rest/"
-    API_KEY = "ac4fd7aa98585b9eee1ba761c209de68"
-    API_SECRET = "3adb0f568dc68393"
+    API_KEY = "90c368449018a0cb880ea4889cbb8681"
+    API_SECRET = "e4b83e319c11e9e1"
     FORMATS = [
         ("o" , "Original"    , None),
         ("6k", "X-Large 6K"  , 6144),
@@ -323,7 +279,10 @@ class FlickrAPI(oauth.OAuth1API):
     def __init__(self, extractor):
         oauth.OAuth1API.__init__(self, extractor)
 
+        self.exif = extractor.config("exif", False)
         self.videos = extractor.config("videos", True)
+        self.contexts = extractor.config("contexts", False)
+
         self.maxsize = extractor.config("size-max")
         if isinstance(self.maxsize, str):
             for fmt, fmtname, fmtwidth in self.FORMATS:
@@ -366,6 +325,18 @@ class FlickrAPI(oauth.OAuth1API):
         """Return photos from the given user's photostream."""
         params = {"user_id": user_id}
         return self._pagination("people.getPhotos", params)
+
+    def photos_getAllContexts(self, photo_id):
+        """Returns all visible sets and pools the photo belongs to."""
+        params = {"photo_id": photo_id}
+        data = self._call("photos.getAllContexts", params)
+        del data["stat"]
+        return data
+
+    def photos_getExif(self, photo_id):
+        """Retrieves a list of EXIF/TIFF/GPS tags for a given photo."""
+        params = {"photo_id": photo_id}
+        return self._call("photos.getExif", params)["photo"]
 
     def photos_getInfo(self, photo_id):
         """Get information about a photo."""
@@ -437,12 +408,18 @@ class FlickrAPI(oauth.OAuth1API):
         params["nojsoncallback"] = "1"
         if self.api_key:
             params["api_key"] = self.api_key
-        data = self.request(self.API_URL, params=params).json()
+        response = self.request(self.API_URL, params=params)
+        try:
+            data = response.json()
+        except ValueError:
+            data = {"code": -1, "message": response.content}
         if "code" in data:
             msg = data.get("message")
             self.log.debug("Server response: %s", data)
             if data["code"] == 1:
                 raise exception.NotFoundError(self.extractor.subcategory)
+            elif data["code"] == 2:
+                raise exception.AuthorizationError(msg)
             elif data["code"] == 98:
                 raise exception.AuthenticationError(msg)
             elif data["code"] == 99:
@@ -451,9 +428,19 @@ class FlickrAPI(oauth.OAuth1API):
         return data
 
     def _pagination(self, method, params, key="photos"):
-        params["extras"] = ("description,date_upload,tags,views,media,"
-                            "path_alias,owner_name,")
-        params["extras"] += ",".join("url_" + fmt[0] for fmt in self.formats)
+        extras = ("description,date_upload,tags,views,media,"
+                  "path_alias,owner_name,")
+        includes = self.extractor.config("metadata")
+        if includes:
+            if isinstance(includes, (list, tuple)):
+                includes = ",".join(includes)
+            elif not isinstance(includes, str):
+                includes = ("license,date_taken,original_format,last_update,"
+                            "geo,machine_tags,o_dims")
+            extras = extras + includes + ","
+        extras += ",".join("url_" + fmt[0] for fmt in self.formats)
+
+        params["extras"] = extras
         params["page"] = 1
 
         while True:
@@ -478,6 +465,8 @@ class FlickrAPI(oauth.OAuth1API):
         photo["views"] = text.parse_int(photo["views"])
         photo["date"] = text.parse_timestamp(photo["dateupload"])
         photo["tags"] = photo["tags"].split()
+
+        self._extract_metadata(photo)
         photo["id"] = text.parse_int(photo["id"])
 
         if "owner" in photo:
@@ -532,6 +521,23 @@ class FlickrAPI(oauth.OAuth1API):
         photo["label"] = stream["type"]
         photo["width"] = photo["height"] = 0
         return photo
+
+    def _extract_metadata(self, photo):
+        if self.exif:
+            try:
+                photo.update(self.photos_getExif(photo["id"]))
+            except Exception as exc:
+                self.log.warning(
+                    "Unable to retrieve 'exif' data for %s (%s: %s)",
+                    photo["id"], exc.__class__.__name__, exc)
+
+        if self.contexts:
+            try:
+                photo.update(self.photos_getAllContexts(photo["id"]))
+            except Exception as exc:
+                self.log.warning(
+                    "Unable to retrieve 'contexts' data for %s (%s: %s)",
+                    photo["id"], exc.__class__.__name__, exc)
 
     @staticmethod
     def _clean_info(info):

@@ -20,8 +20,7 @@ class SzurubooruExtractor(booru.BooruExtractor):
     filename_fmt = "{id}_{version}_{checksumMD5}.{extension}"
     per_page = 100
 
-    def __init__(self, match):
-        booru.BooruExtractor.__init__(self, match)
+    def _init(self):
         self.headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -87,6 +86,15 @@ BASE_PATTERN = SzurubooruExtractor.update({
     "bcbnsfw": {
         "root": "https://booru.bcbnsfw.space",
         "pattern": r"booru\.bcbnsfw\.space",
+        "query-all": "*",
+    },
+    "snootbooru": {
+        "root": "https://snootbooru.com",
+        "pattern": r"snootbooru\.com",
+    },
+    "visuabusters": {
+        "root": "https://www.visuabusters.com/booru",
+        "pattern": r"(?:www\.)?visuabusters\.com/booru",
     },
 })
 
@@ -95,50 +103,31 @@ class SzurubooruTagExtractor(SzurubooruExtractor):
     subcategory = "tag"
     directory_fmt = ("{category}", "{search_tags}")
     archive_fmt = "t_{search_tags}_{id}_{version}"
-    pattern = BASE_PATTERN + r"/posts/query=([^/?#]+)"
-    test = (
-        ("https://booru.foalcon.com/posts/query=simple_background", {
-            "pattern": r"https://booru\.foalcon\.com/data/posts"
-                       r"/\d+_[0-9a-f]{16}\.\w+",
-            "range": "1-150",
-            "count": 150,
-        }),
-        ("https://booru.bcbnsfw.space/posts/query=simple_background"),
-    )
+    pattern = BASE_PATTERN + r"/posts(?:/query=([^/?#]*))?"
+    example = "https://booru.foalcon.com/posts/query=TAG"
 
     def __init__(self, match):
         SzurubooruExtractor.__init__(self, match)
-        query = match.group(match.lastindex)
-        self.query = text.unquote(query.replace("+", " "))
+        query = self.groups[-1]
+        self.query = text.unquote(query.replace("+", " ")) if query else ""
 
     def metadata(self):
         return {"search_tags": self.query}
 
     def posts(self):
-        return self._pagination("/posts/", {"query": self.query})
+        if self.query.strip():
+            query = self.query
+        else:
+            query = self.config_instance("query-all")
+
+        return self._pagination("/posts/", {"query": query})
 
 
 class SzurubooruPostExtractor(SzurubooruExtractor):
     subcategory = "post"
     archive_fmt = "{id}_{version}"
     pattern = BASE_PATTERN + r"/post/(\d+)"
-    test = (
-        ("https://booru.foalcon.com/post/30092", {
-            "pattern": r"https://booru\.foalcon\.com/data/posts"
-                       r"/30092_b7d56e941888b624\.png",
-            "url": "dad4d4c67d87cd9a4ac429b3414747c27a95d5cb",
-            "content": "86d1514c0ca8197950cc4b74e7a59b2dc76ebf9c",
-        }),
-        ("https://booru.bcbnsfw.space/post/1599", {
-            "pattern": r"https://booru\.bcbnsfw\.space/data/posts"
-                       r"/1599_53784518e92086bd\.png",
-            "content": "0c38fc612ba1f03950fad31c4f80a1fccdab1096",
-        }),
-    )
-
-    def __init__(self, match):
-        SzurubooruExtractor.__init__(self, match)
-        self.post_id = match.group(match.lastindex)
+    example = "https://booru.foalcon.com/post/12345"
 
     def posts(self):
-        return (self._api_request("/post/" + self.post_id),)
+        return (self._api_request("/post/" + self.groups[-1]),)

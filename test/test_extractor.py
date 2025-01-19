@@ -17,12 +17,21 @@ import string
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gallery_dl import extractor  # noqa E402
+from gallery_dl import extractor, util  # noqa E402
 from gallery_dl.extractor import mastodon  # noqa E402
 from gallery_dl.extractor.common import Extractor, Message  # noqa E402
 from gallery_dl.extractor.directlink import DirectlinkExtractor  # noqa E402
 
 _list_classes = extractor._list_classes
+
+try:
+    RESULTS = os.environ.get("GDL_TEST_RESULTS")
+    if RESULTS:
+        results = util.import_file(RESULTS)
+    else:
+        from test import results
+except ImportError:
+    results = None
 
 
 class FakeExtractor(Extractor):
@@ -40,7 +49,7 @@ class TestExtractorModule(unittest.TestCase):
         "https://example.org/file.jpg",
         "tumblr:foobar",
         "oauth:flickr",
-        "test:pixiv:",
+        "generic:https://example.org/",
         "recursive:https://example.org/document.html",
     )
 
@@ -92,21 +101,46 @@ class TestExtractorModule(unittest.TestCase):
             with self.assertRaises(TypeError):
                 FakeExtractor.from_url(invalid)
 
-    def test_unique_pattern_matches(self):
-        test_urls = []
+    @unittest.skipIf(not results, "no test data")
+    def test_categories(self):
+        for result in results.all():
+            url = result["#url"]
+            cls = result["#class"]
+            try:
+                extr = cls.from_url(url)
+            except ImportError as exc:
+                if exc.name in ("youtube_dl", "yt_dlp"):
+                    print("Skipping '{}' category checks".format(cls.category))
+                    continue
+                raise
+            self.assertTrue(extr, url)
 
+            categories = result.get("#category")
+            if categories:
+                base, cat, sub = categories
+            else:
+                cat = cls.category
+                sub = cls.subcategory
+                base = cls.basecategory
+            self.assertEqual(extr.category, cat, url)
+            self.assertEqual(extr.subcategory, sub, url)
+            self.assertEqual(extr.basecategory, base, url)
+
+    @unittest.skipIf(not results, "no test data")
+    def test_unique_pattern_matches(self):
         # collect testcase URLs
+        test_urls = []
         append = test_urls.append
-        for extr in extractor.extractors():
-            for testcase in extr._get_tests():
-                append((testcase[0], extr))
+
+        for result in results.all():
+            append((result["#url"], result["#class"]))
 
         # iterate over all testcase URLs
         for url, extr1 in test_urls:
             matches = []
 
             # ... and apply all regex patterns to each one
-            for extr2 in extractor._cache:
+            for extr2 in _list_classes():
 
                 # skip DirectlinkExtractor pattern if it isn't tested
                 if extr1 != DirectlinkExtractor and \
@@ -132,8 +166,36 @@ class TestExtractorModule(unittest.TestCase):
             else:
                 self.assertIs(extr1, matches[0][1], url)
 
+    def test_init(self):
+        """Test for exceptions in Extractor.initialize() and .finalize()"""
+        def fail_request(*args, **kwargs):
+            self.fail("called 'request() during initialization")
+
+        for cls in extractor.extractors():
+            if cls.category == "ytdl":
+                continue
+            extr = cls.from_url(cls.example)
+            if not extr and cls.basecategory and not cls.instances:
+                continue
+
+            extr.request = fail_request
+            extr.initialize()
+            extr.finalize()
+
+    @unittest.skipIf(sys.hexversion < 0x3060000, "test fails in CI")
+    def test_init_ytdl(self):
+        try:
+            extr = extractor.find("ytdl:")
+            extr.initialize()
+            extr.finalize()
+        except ImportError as exc:
+            if exc.name in ("youtube_dl", "yt_dlp"):
+                raise unittest.SkipTest("cannot import module '{}'".format(
+                    exc.name))
+            raise
+
     def test_docstrings(self):
-        """ensure docstring uniqueness"""
+        """Ensure docstring uniqueness"""
         for extr1 in extractor.extractors():
             for extr2 in extractor.extractors():
                 if extr1 != extr2 and extr1.__doc__ and extr2.__doc__:
@@ -164,7 +226,7 @@ class TestExtractorModule(unittest.TestCase):
 class TestExtractorWait(unittest.TestCase):
 
     def test_wait_seconds(self):
-        extr = extractor.find("test:")
+        extr = extractor.find("generic:https://example.org/")
         seconds = 5
         until = time.time() + seconds
 
@@ -178,7 +240,7 @@ class TestExtractorWait(unittest.TestCase):
             self._assert_isotime(calls[0][1][1], until)
 
     def test_wait_until(self):
-        extr = extractor.find("test:")
+        extr = extractor.find("generic:https://example.org/")
         until = time.time() + 5
 
         with patch("time.sleep") as sleep, patch.object(extr, "log") as log:
@@ -193,9 +255,12 @@ class TestExtractorWait(unittest.TestCase):
             self._assert_isotime(calls[0][1][1], until)
 
     def test_wait_until_datetime(self):
-        extr = extractor.find("test:")
-        until = datetime.utcnow() + timedelta(seconds=5)
+        extr = extractor.find("generic:https://example.org/")
+        until = util.datetime_utcnow() + timedelta(seconds=5)
         until_local = datetime.now() + timedelta(seconds=5)
+
+        if not until.microsecond:
+            until = until.replace(microsecond=until_local.microsecond)
 
         with patch("time.sleep") as sleep, patch.object(extr, "log") as log:
             extr.wait(until=until)
@@ -213,7 +278,7 @@ class TestExtractorWait(unittest.TestCase):
             until = datetime.fromtimestamp(until)
         o = self._isotime_to_seconds(output)
         u = self._isotime_to_seconds(until.time().isoformat()[:8])
-        self.assertLess(o-u, 1.0)
+        self.assertLessEqual(o-u, 1.0)
 
     @staticmethod
     def _isotime_to_seconds(isotime):

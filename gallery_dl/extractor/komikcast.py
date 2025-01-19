@@ -1,24 +1,24 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2018-2022 Mike Fährmann
+# Copyright 2018-2023 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
 # published by the Free Software Foundation.
 
-"""Extractors for https://komikcast.site/"""
+"""Extractors for https://komikcast.cz/"""
 
 from .common import ChapterExtractor, MangaExtractor
 from .. import text
 import re
 
-BASE_PATTERN = r"(?:https?://)?(?:www\.)?komikcast\.(?:site|me|com)"
+BASE_PATTERN = r"(?:https?://)?(?:www\.)?komikcast\.(?:cz|lol|site|mo?e|com)"
 
 
 class KomikcastBase():
     """Base class for komikcast extractors"""
     category = "komikcast"
-    root = "https://komikcast.site"
+    root = "https://komikcast.cz"
 
     @staticmethod
     def parse_chapter_string(chapter_string, data=None):
@@ -46,20 +46,9 @@ class KomikcastBase():
 
 
 class KomikcastChapterExtractor(KomikcastBase, ChapterExtractor):
-    """Extractor for manga-chapters from komikcast.site"""
+    """Extractor for komikcast manga chapters"""
     pattern = BASE_PATTERN + r"(/chapter/[^/?#]+/)"
-    test = (
-        (("https://komikcast.site/chapter"
-          "/apotheosis-chapter-02-2-bahasa-indonesia/"), {
-            "url": "f6b43fbc027697749b3ea1c14931c83f878d7936",
-            "keyword": "f3938e1aff9ad1f302f52447e9781b21f6da26d4",
-        }),
-        (("https://komikcast.me/chapter"
-          "/soul-land-ii-chapter-300-1-bahasa-indonesia/"), {
-            "url": "efd00a9bd95461272d51990d7bc54b79ff3ff2e6",
-            "keyword": "cb646cfed3d45105bd645ab38b2e9f7d8c436436",
-        }),
-    )
+    example = "https://komikcast.cz/chapter/TITLE/"
 
     def metadata(self, page):
         info = text.extr(page, "<title>", " - Komikcast<")
@@ -76,16 +65,10 @@ class KomikcastChapterExtractor(KomikcastBase, ChapterExtractor):
 
 
 class KomikcastMangaExtractor(KomikcastBase, MangaExtractor):
-    """Extractor for manga from komikcast.site"""
+    """Extractor for komikcast manga"""
     chapterclass = KomikcastChapterExtractor
     pattern = BASE_PATTERN + r"(/(?:komik/)?[^/?#]+)/?$"
-    test = (
-        ("https://komikcast.site/komik/090-eko-to-issho/", {
-            "url": "19d3d50d532e84be6280a3d61ff0fd0ca04dd6b4",
-            "keyword": "837a7e96867344ff59d840771c04c20dc46c0ab1",
-        }),
-        ("https://komikcast.me/tonari-no-kashiwagi-san/"),
-    )
+    example = "https://komikcast.cz/komik/TITLE"
 
     def chapters(self, page):
         results = []
@@ -93,8 +76,10 @@ class KomikcastMangaExtractor(KomikcastBase, MangaExtractor):
 
         for item in text.extract_iter(
                 page, '<a class="chapter-link-item" href="', '</a'):
-            url, _, chapter_string = item.rpartition('">Chapter ')
-            self.parse_chapter_string(chapter_string, data)
+            url, _, chapter = item.rpartition('">Chapter')
+            chapter, sep, minor = chapter.strip().partition(".")
+            data["chapter"] = text.parse_int(chapter)
+            data["chapter_minor"] = sep + minor
             results.append((url, data.copy()))
         return results
 

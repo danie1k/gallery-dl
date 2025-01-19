@@ -26,13 +26,15 @@ class MangadexExtractor(Extractor):
         "{manga}_c{chapter:>03}{chapter_minor}_{page:>03}.{extension}")
     archive_fmt = "{chapter_id}_{page}"
     root = "https://mangadex.org"
+    useragent = util.USERAGENT
     _cache = {}
 
     def __init__(self, match):
         Extractor.__init__(self, match)
-        self.session.headers["User-Agent"] = util.USERAGENT
-        self.api = MangadexAPI(self)
         self.uuid = match.group(1)
+
+    def _init(self):
+        self.api = MangadexAPI(self)
 
     def items(self):
         for chapter in self.chapters():
@@ -85,6 +87,10 @@ class MangadexExtractor(Extractor):
         data["group"] = [group["attributes"]["name"]
                          for group in relationships["scanlation_group"]]
 
+        data["status"] = mattributes["status"]
+        data["tags"] = [tag["attributes"]["name"]["en"]
+                        for tag in mattributes["tags"]]
+
         return data
 
 
@@ -92,25 +98,8 @@ class MangadexChapterExtractor(MangadexExtractor):
     """Extractor for manga-chapters from mangadex.org"""
     subcategory = "chapter"
     pattern = BASE_PATTERN + r"/chapter/([0-9a-f-]+)"
-    test = (
-        ("https://mangadex.org/chapter/f946ac53-0b71-4b5d-aeb2-7931b13c4aaa", {
-            "keyword": "86fb262cf767dac6d965cd904ad499adba466404",
-            #  "content": "50383a4c15124682057b197d40261641a98db514",
-        }),
-        # oneshot
-        ("https://mangadex.org/chapter/61a88817-9c29-4281-bdf1-77b3c1be9831", {
-            "count": 64,
-            "keyword": "6abcbe1e24eeb1049dc931958853cd767ee483fb",
-        }),
-        # MANGA Plus (#1154)
-        ("https://mangadex.org/chapter/74149a55-e7c4-44ea-8a37-98e879c1096f", {
-            "exception": exception.StopExtraction,
-        }),
-        # 'externalUrl', but still downloadable (#2503)
-        ("https://mangadex.org/chapter/364728a4-6909-4164-9eea-6b56354f7c78", {
-            "count": 0,  # 404
-        }),
-    )
+    example = ("https://mangadex.org/chapter"
+               "/01234567-89ab-cdef-0123-456789abcdef")
 
     def items(self):
         try:
@@ -142,34 +131,8 @@ class MangadexMangaExtractor(MangadexExtractor):
     """Extractor for manga from mangadex.org"""
     subcategory = "manga"
     pattern = BASE_PATTERN + r"/(?:title|manga)/(?!feed$)([0-9a-f-]+)"
-    test = (
-        ("https://mangadex.org/title/f90c4398-8aad-4f51-8a1f-024ca09fdcbc", {
-            "keyword": {
-                "manga"   : "Souten no Koumori",
-                "manga_id": "f90c4398-8aad-4f51-8a1f-024ca09fdcbc",
-                "title"   : "re:One[Ss]hot",
-                "volume"  : 0,
-                "chapter" : 0,
-                "chapter_minor": "",
-                "chapter_id": str,
-                "date"    : "type:datetime",
-                "lang"    : str,
-                "language": str,
-                "artist"  : ["Arakawa Hiromu"],
-                "author"  : ["Arakawa Hiromu"],
-            },
-        }),
-        ("https://mangadex.cc/manga/d0c88e3b-ea64-4e07-9841-c1d2ac982f4a/", {
-            "options": (("lang", "en"),),
-            "count": ">= 100",
-        }),
-        ("https://mangadex.org/title/7c1e2742-a086-4fd3-a3be-701fd6cf0be9", {
-            "count": 1,
-        }),
-        ("https://mangadex.org/title/584ef094-b2ab-40ce-962c-bce341fb9d10", {
-            "count": ">= 20",
-        })
-    )
+    example = ("https://mangadex.org/title"
+               "/01234567-89ab-cdef-0123-456789abcdef")
 
     def chapters(self):
         return self.api.manga_feed(self.uuid)
@@ -179,20 +142,63 @@ class MangadexFeedExtractor(MangadexExtractor):
     """Extractor for chapters from your Followed Feed"""
     subcategory = "feed"
     pattern = BASE_PATTERN + r"/title/feed$()"
-    test = ("https://mangadex.org/title/feed",)
+    example = "https://mangadex.org/title/feed"
 
     def chapters(self):
         return self.api.user_follows_manga_feed()
 
 
+class MangadexListExtractor(MangadexExtractor):
+    """Extractor for mangadex lists"""
+    subcategory = "list"
+    pattern = (BASE_PATTERN +
+               r"/list/([0-9a-f-]+)(?:/[^/?#]*)?(?:\?tab=(\w+))?")
+    example = ("https://mangadex.org/list"
+               "/01234567-89ab-cdef-0123-456789abcdef/NAME")
+
+    def __init__(self, match):
+        MangadexExtractor.__init__(self, match)
+        if match.group(2) == "feed":
+            self.subcategory = "list-feed"
+        else:
+            self.items = self._items_titles
+
+    def chapters(self):
+        return self.api.list_feed(self.uuid)
+
+    def _items_titles(self):
+        data = {"_extractor": MangadexMangaExtractor}
+        for item in self.api.list(self.uuid)["relationships"]:
+            if item["type"] == "manga":
+                url = "{}/title/{}".format(self.root, item["id"])
+                yield Message.Queue, url, data
+
+
+class MangadexAuthorExtractor(MangadexExtractor):
+    """Extractor for mangadex authors"""
+    subcategory = "author"
+    pattern = BASE_PATTERN + r"/author/([0-9a-f-]+)"
+    example = ("https://mangadex.org/author"
+               "/01234567-89ab-cdef-0123-456789abcdef/NAME")
+
+    def items(self):
+        for manga in self.api.manga_author(self.uuid):
+            manga["_extractor"] = MangadexMangaExtractor
+            url = "{}/title/{}".format(self.root, manga["id"])
+            yield Message.Queue, url, manga
+
+
 class MangadexAPI():
-    """Interface for the MangaDex API v5"""
+    """Interface for the MangaDex API v5
+
+    https://api.mangadex.org/docs/
+    """
 
     def __init__(self, extr):
         self.extractor = extr
         self.headers = {}
 
-        self.username, self.password = self.extractor._get_auth_info()
+        self.username, self.password = extr._get_auth_info()
         if not self.username:
             self.authenticate = util.noop
 
@@ -203,14 +209,28 @@ class MangadexAPI():
     def athome_server(self, uuid):
         return self._call("/at-home/server/" + uuid)
 
+    def author(self, uuid, manga=False):
+        params = {"includes[]": ("manga",)} if manga else None
+        return self._call("/author/" + uuid, params)["data"]
+
     def chapter(self, uuid):
         params = {"includes[]": ("scanlation_group",)}
         return self._call("/chapter/" + uuid, params)["data"]
+
+    def list(self, uuid):
+        return self._call("/list/" + uuid)["data"]
+
+    def list_feed(self, uuid):
+        return self._pagination_chapters("/list/" + uuid + "/feed")
 
     @memcache(keyarg=1)
     def manga(self, uuid):
         params = {"includes[]": ("artist", "author")}
         return self._call("/manga/" + uuid, params)["data"]
+
+    def manga_author(self, uuid_author):
+        params = {"authorOrArtist": uuid_author}
+        return self._pagination_manga("/manga", params)
 
     def manga_feed(self, uuid):
         order = "desc" if self.extractor.config("chapter-reverse") else "asc"
@@ -218,11 +238,11 @@ class MangadexAPI():
             "order[volume]" : order,
             "order[chapter]": order,
         }
-        return self._pagination("/manga/" + uuid + "/feed", params)
+        return self._pagination_chapters("/manga/" + uuid + "/feed", params)
 
     def user_follows_manga_feed(self):
         params = {"order[publishAt]": "desc"}
-        return self._pagination("/user/follows/manga/feed", params)
+        return self._pagination_chapters("/user/follows/manga/feed", params)
 
     def authenticate(self):
         self.headers["Authorization"] = \
@@ -269,18 +289,31 @@ class MangadexAPI():
             raise exception.StopExtraction(
                 "%s %s (%s)", response.status_code, response.reason, msg)
 
-    def _pagination(self, endpoint, params=None):
+    def _pagination_chapters(self, endpoint, params=None):
         if params is None:
             params = {}
 
+        lang = self.extractor.config("lang")
+        if isinstance(lang, str) and "," in lang:
+            lang = lang.split(",")
+        params["translatedLanguage[]"] = lang
+        params["includes[]"] = ("scanlation_group",)
+
+        return self._pagination(endpoint, params)
+
+    def _pagination_manga(self, endpoint, params=None):
+        if params is None:
+            params = {}
+
+        return self._pagination(endpoint, params)
+
+    def _pagination(self, endpoint, params):
         config = self.extractor.config
+
         ratings = config("ratings")
         if ratings is None:
             ratings = ("safe", "suggestive", "erotica", "pornographic")
-
         params["contentRating[]"] = ratings
-        params["includes[]"] = ("scanlation_group",)
-        params["translatedLanguage[]"] = config("lang")
         params["offset"] = 0
 
         api_params = config("api-parameters")
@@ -296,6 +329,6 @@ class MangadexAPI():
                 return
 
 
-@cache(maxage=28*24*3600, keyarg=0)
+@cache(maxage=28*86400, keyarg=0)
 def _refresh_token_cache(username):
     return None

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2021-2022 Mike Fährmann
+# Copyright 2021-2023 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -19,7 +19,7 @@ class YoutubeDLExtractor(Extractor):
     filename_fmt = "{title}-{id}.{extension}"
     archive_fmt = "{extractor_key} {id}"
     pattern = r"ytdl:(.*)"
-    test = ("ytdl:https://www.youtube.com/watch?v=BaW_jenozKc&t=1s&end=9",)
+    example = "ytdl:https://www.youtube.com/watch?v=abcdefghijk"
 
     def __init__(self, match):
         # import main youtube_dl module
@@ -76,7 +76,7 @@ class YoutubeDLExtractor(Extractor):
             ytdl_module, self, user_opts, extr_opts)
 
         # transfer cookies to ytdl
-        cookies = self.session.cookies
+        cookies = self.cookies
         if cookies:
             set_cookie = ytdl_instance.cookiejar.set_cookie
             for cookie in cookies:
@@ -116,21 +116,20 @@ class YoutubeDLExtractor(Extractor):
         for entry in entries:
             if not entry:
                 continue
-            elif entry.get("_type") in ("url", "url_transparent"):
+
+            if entry.get("_type") in ("url", "url_transparent"):
                 try:
-                    info_dict = ytdl_instance.extract_info(
+                    entry = ytdl_instance.extract_info(
                         entry["url"], False,
                         ie_key=entry.get("ie_key"))
                 except ytdl_module.utils.YoutubeDLError:
                     continue
-
-                if not info_dict:
+                if not entry:
                     continue
-                elif "entries" in info_dict:
-                    yield from self._process_entries(
-                        ytdl_module, ytdl_instance, info_dict["entries"])
-                else:
-                    yield info_dict
+
+            if "entries" in entry:
+                yield from self._process_entries(
+                    ytdl_module, ytdl_instance, entry["entries"])
             else:
                 yield entry
 

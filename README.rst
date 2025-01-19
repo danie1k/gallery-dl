@@ -7,8 +7,8 @@ to download image galleries and collections
 from several image hosting sites
 (see `Supported Sites <docs/supportedsites.md>`__).
 It is a cross-platform tool
-with many `configuration options <docs/configuration.rst>`__
-and powerful `filenaming capabilities <docs/formatting.md>`__.
+with many `configuration options <https://gdl-org.github.io/docs/configuration.html>`__
+and powerful `filenaming capabilities <https://gdl-org.github.io/docs/formatting.html>`__.
 
 
 |pypi| |build|
@@ -25,10 +25,12 @@ Dependencies
 Optional
 --------
 
+- yt-dlp_ or youtube-dl_: HLS/DASH video downloads, ``ytdl`` integration
 - FFmpeg_: Pixiv Ugoira conversion
-- yt-dlp_ or youtube-dl_: Video downloads
+- mkvmerge_: Accurate Ugoira frame timecodes
 - PySocks_: SOCKS proxy support
 - brotli_ or brotlicffi_: Brotli compression support
+- zstandard_: Zstandard compression support
 - PyYAML_: YAML configuration file support
 - toml_: TOML configuration file support for Python<3.11
 - SecretStorage_: GNOME keyring passwords for ``--cookies-from-browser``
@@ -53,7 +55,9 @@ pip_ as well:
 
 .. code:: bash
 
-    python3 -m pip install -U -I --no-deps --no-cache-dir https://github.com/mikf/gallery-dl/archive/master.tar.gz
+    python3 -m pip install -U --force-reinstall --no-deps https://github.com/mikf/gallery-dl/archive/master.tar.gz
+
+Omit :code:`--no-deps` if Requests_ hasn't been installed yet.
 
 Note: Windows users should use :code:`py -3` instead of :code:`python3`.
 
@@ -72,16 +76,16 @@ Standalone Executable
 Prebuilt executable files with a Python interpreter and
 required Python packages included are available for
 
-- `Windows <https://github.com/mikf/gallery-dl/releases/download/v1.25.3/gallery-dl.exe>`__
+- `Windows <https://github.com/mikf/gallery-dl/releases/download/v1.28.4/gallery-dl.exe>`__
   (Requires `Microsoft Visual C++ Redistributable Package (x86) <https://aka.ms/vs/17/release/vc_redist.x86.exe>`__)
-- `Linux   <https://github.com/mikf/gallery-dl/releases/download/v1.25.3/gallery-dl.bin>`__
+- `Linux   <https://github.com/mikf/gallery-dl/releases/download/v1.28.4/gallery-dl.bin>`__
 
 
 Nightly Builds
 --------------
 
 | Executables build from the latest commit can be found at
-| https://github.com/mikf/gallery-dl/actions/workflows/executables.yml
+| https://github.com/gdl-org/builds/releases
 
 
 Snap
@@ -113,7 +117,6 @@ Scoop
 
     scoop install gallery-dl
 
-
 Homebrew
 --------
 
@@ -132,6 +135,85 @@ For macOS users with MacPorts:
 
     sudo port install gallery-dl
 
+Docker
+--------
+Using the Dockerfile in the repository:
+
+.. code:: bash
+
+    git clone https://github.com/mikf/gallery-dl.git
+    cd gallery-dl/
+    docker build -t gallery-dl:latest .
+
+Pulling image from `Docker Hub <https://hub.docker.com/r/mikf123/gallery-dl>`__:
+
+.. code:: bash
+
+    docker pull mikf123/gallery-dl
+    docker tag mikf123/gallery-dl gallery-dl
+
+Pulling image from `GitHub Container Registry <https://github.com/mikf/gallery-dl/pkgs/container/gallery-dl>`__:
+
+.. code:: bash
+
+    docker pull ghcr.io/mikf/gallery-dl
+    docker tag ghcr.io/mikf/gallery-dl gallery-dl
+
+To run the container you will probably want to attach some directories on the host so that the config file and downloads can persist across runs.
+
+Make sure to either download the example config file reference in the repo and place it in the mounted volume location or touch an empty file there.
+
+If you gave the container a different tag or are using podman then make sure you adjust.  Run ``docker image ls`` to check the name if you are not sure.
+
+This will remove the container after every use so you will always have a fresh environment for it to run. If you setup a ci-cd pipeline to autobuild the container you can also add a ``--pull=newer`` flag so that when you run it docker will check to see if there is a newer container and download it before running.
+
+.. code:: bash
+
+    docker run --rm  -v $HOME/Downloads/:/gallery-dl/ -v $HOME/.config/gallery-dl/gallery-dl.conf:/etc/gallery-dl.conf -it gallery-dl:latest
+
+You can also add an alias to your shell for "gallery-dl" or create a simple bash script and drop it somewhere in your $PATH to act as a shim for this command.
+
+Nix and Home Manager
+--------------------------
+
+Adding *gallery-dl* to your system environment:
+
+.. code:: nix
+
+    environment.systemPackages = with pkgs; [
+      gallery-dl
+    ];
+
+Using :code:`nix-shell`
+
+.. code:: bash
+
+    nix-shell -p gallery-dl
+
+.. code:: bash
+
+    nix-shell -p gallery-dl --run "gallery-dl <args>"
+
+For Home Manager users, you can manage *gallery-dl* declaratively:
+
+.. code:: nix
+
+    programs.gallery-dl = {
+      enable = true;
+      settings = {
+        extractor.base-directory = "~/Downloads";
+      };
+    };
+
+Alternatively, you can just add it to :code:`home.packages` if you don't want to manage it declaratively:
+
+.. code:: nix
+
+    home.packages = with pkgs; [
+      gallery-dl
+    ];
+
+After making these changes, simply rebuild your configuration and open a new shell to have *gallery-dl* available.
 
 Usage
 =====
@@ -197,7 +279,7 @@ Documentation
 -------------
 
 A list of all available configuration options and their descriptions
-can be found in `<docs/configuration.rst>`__.
+can be found at `<https://gdl-org.github.io/docs/configuration.html>`__.
 
 | For a default configuration file with available options set to their
   default values, see `<docs/gallery-dl.conf>`__.
@@ -293,7 +375,7 @@ CAPTCHA or similar, or has not been implemented yet, you can use the
 cookies from a browser login session and input them into *gallery-dl*.
 
 This can be done via the
-`cookies <docs/configuration.rst#extractorcookies>`__
+`cookies <https://gdl-org.github.io/docs/configuration.html#extractor-cookies>`__
 option in your configuration file by specifying
 
 - | the path to a Mozilla/Netscape format cookies.txt file exported by a browser addon
@@ -380,11 +462,13 @@ To authenticate with a ``mastodon`` instance, run *gallery-dl* with
 .. _pip:        https://pip.pypa.io/en/stable/
 .. _Requests:   https://requests.readthedocs.io/en/master/
 .. _FFmpeg:     https://www.ffmpeg.org/
+.. _mkvmerge:   https://www.matroska.org/downloads/mkvtoolnix.html
 .. _yt-dlp:     https://github.com/yt-dlp/yt-dlp
 .. _youtube-dl: https://ytdl-org.github.io/youtube-dl/
 .. _PySocks:    https://pypi.org/project/PySocks/
 .. _brotli:     https://github.com/google/brotli
 .. _brotlicffi: https://github.com/python-hyper/brotlicffi
+.. _zstandard:  https://github.com/indygreg/python-zstandard
 .. _PyYAML:     https://pyyaml.org/
 .. _toml:       https://pypi.org/project/toml/
 .. _SecretStorage: https://pypi.org/project/SecretStorage/

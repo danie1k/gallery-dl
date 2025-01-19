@@ -6,15 +6,17 @@
 # it under the terms of the GNU General Public License version 2 as
 # published by the Free Software Foundation.
 
-"""Extractors for https://twitter.com/"""
+"""Extractors for https://x.com/"""
 
 from .common import Extractor, Message
 from .. import text, util, exception
-from ..cache import cache
+from ..cache import cache, memcache
 import itertools
-import json
+import random
+import re
 
-BASE_PATTERN = r"(?:https?://)?(?:www\.|mobile\.)?(?:[fv]x)?twitter\.com"
+BASE_PATTERN = (r"(?:https?://)?(?:www\.|mobile\.)?"
+                r"(?:(?:[fv]x)?twitter|(?:fix(?:up|v))?x)\.com")
 
 
 class TwitterExtractor(Extractor):
@@ -23,14 +25,17 @@ class TwitterExtractor(Extractor):
     directory_fmt = ("{category}", "{user[name]}")
     filename_fmt = "{tweet_id}_{num}.{extension}"
     archive_fmt = "{tweet_id}_{retweet_id}_{num}"
-    cookiedomain = ".twitter.com"
-    cookienames = ("auth_token",)
-    root = "https://twitter.com"
+    cookies_domain = ".x.com"
+    cookies_names = ("auth_token",)
+    root = "https://x.com"
     browser = "firefox"
 
     def __init__(self, match):
         Extractor.__init__(self, match)
         self.user = match.group(1)
+
+    def _init(self):
+        self.unavailable = self.config("unavailable", False)
         self.textonly = self.config("text-tweets", False)
         self.retweets = self.config("retweets", False)
         self.replies = self.config("replies", True)
@@ -39,12 +44,14 @@ class TwitterExtractor(Extractor):
         self.quoted = self.config("quoted", False)
         self.videos = self.config("videos", True)
         self.cards = self.config("cards", False)
+        self.ads = self.config("ads", False)
         self.cards_blacklist = self.config("cards-blacklist")
-        self.syndication = self.config("syndication")
 
         if not self.config("transform", True):
             self._transform_user = util.identity
             self._transform_tweet = util.identity
+
+        self._cursor = None
         self._user = None
         self._user_obj = None
         self._user_cache = {}
@@ -74,6 +81,10 @@ class TwitterExtractor(Extractor):
             seen_tweets = set()
         else:
             seen_tweets = None
+
+        if self.twitpic:
+            self._find_twitpic = re.compile(
+                r"https?(://twitpic\.com/(?!photos/)\w+)").findall
 
         for tweet in self.tweets():
 
@@ -134,6 +145,16 @@ class TwitterExtractor(Extractor):
 
     def _extract_media(self, tweet, entities, files):
         for media in entities:
+
+            if "ext_media_availability" in media:
+                ext = media["ext_media_availability"]
+                if ext.get("status") == "Unavailable":
+                    self.log.warning("Media unavailable (%s - '%s')",
+                                     tweet["id_str"], ext.get("reason"))
+                    if not self.unavailable:
+                        continue
+
+            mtype = media.get("type")
             descr = media.get("ext_alt_text")
             width = media["original_info"].get("width", 0)
             height = media["original_info"].get("height", 0)
@@ -143,6 +164,7 @@ class TwitterExtractor(Extractor):
                     files.append({
                         "url": "ytdl:{}/i/web/status/{}".format(
                             self.root, tweet["id_str"]),
+                        "type"       : mtype,
                         "width"      : width,
                         "height"     : height,
                         "extension"  : None,
@@ -156,6 +178,7 @@ class TwitterExtractor(Extractor):
                     )
                     files.append({
                         "url"        : variant["url"],
+                        "type"       : mtype,
                         "width"      : width,
                         "height"     : height,
                         "bitrate"    : variant.get("bitrate", 0),
@@ -172,6 +195,7 @@ class TwitterExtractor(Extractor):
                     base = url.rpartition("=")[0] + "="
                 files.append(text.nameext_from_url(url, {
                     "url"        : base + self._size_image,
+                    "type"       : mtype,
                     "width"      : width,
                     "height"     : height,
                     "_fallback"  : self._image_fallback(base),
@@ -231,12 +255,24 @@ class TwitterExtractor(Extractor):
             files.append({"url": url})
 
     def _extract_twitpic(self, tweet, files):
-        for url in tweet["entities"].get("urls", ()):
-            url = url["expanded_url"]
-            if "//twitpic.com/" not in url or "/photos/" in url:
+        urls = {}
+
+        # collect URLs from entities
+        for url in tweet["entities"].get("urls") or ():
+            url = url.get("expanded_url") or url.get("url") or ""
+            if not url or "//twitpic.com/" not in url or "/photos/" in url:
                 continue
             if url.startswith("http:"):
                 url = "https" + url[4:]
+            urls[url] = None
+
+        # collect URLs from text
+        for url in self._find_twitpic(
+                tweet.get("full_text") or tweet.get("text") or ""):
+            urls["https" + url] = None
+
+        # extract actual URLs
+        for url in urls:
             response = self.request(url, fatal=False)
             if response.status_code >= 400:
                 continue
@@ -253,23 +289,24 @@ class TwitterExtractor(Extractor):
             author = tweet["user"]
         author = self._transform_user(author)
 
-        if "note_tweet" in tweet:
-            note = tweet["note_tweet"]["note_tweet_results"]["result"]
-        else:
-            note = None
-
         if "legacy" in tweet:
-            tweet = tweet["legacy"]
+            legacy = tweet["legacy"]
+        else:
+            legacy = tweet
+        tget = legacy.get
 
-        tweet_id = int(tweet["id_str"])
+        tweet_id = int(legacy["id_str"])
         if tweet_id >= 300000000000000:
             date = text.parse_timestamp(
                 ((tweet_id >> 22) + 1288834974657) // 1000)
         else:
-            date = text.parse_datetime(
-                tweet["created_at"], "%a %b %d %H:%M:%S %z %Y")
+            try:
+                date = text.parse_datetime(
+                    legacy["created_at"], "%a %b %d %H:%M:%S %z %Y")
+            except Exception:
+                date = util.NONE
+        source = tweet.get("source")
 
-        tget = tweet.get
         tdata = {
             "tweet_id"      : tweet_id,
             "retweet_id"    : text.parse_int(
@@ -278,17 +315,36 @@ class TwitterExtractor(Extractor):
                 tget("quoted_by_id_str")),
             "reply_id"      : text.parse_int(
                 tget("in_reply_to_status_id_str")),
+            "conversation_id": text.parse_int(
+                tget("conversation_id_str")),
             "date"          : date,
             "author"        : author,
             "user"          : self._user or author,
-            "lang"          : tweet["lang"],
+            "lang"          : legacy["lang"],
+            "source"        : text.extr(source, ">", "<") if source else "",
+            "sensitive"     : tget("possibly_sensitive"),
             "favorite_count": tget("favorite_count"),
             "quote_count"   : tget("quote_count"),
             "reply_count"   : tget("reply_count"),
             "retweet_count" : tget("retweet_count"),
+            "bookmark_count": tget("bookmark_count"),
         }
 
-        entities = note["entity_set"] if note else tweet["entities"]
+        if "views" in tweet:
+            try:
+                tdata["view_count"] = int(tweet["views"]["count"])
+            except Exception:
+                tdata["view_count"] = 0
+        else:
+            tdata["view_count"] = 0
+
+        if "note_tweet" in tweet:
+            note = tweet["note_tweet"]["note_tweet_results"]["result"]
+            content = note["text"]
+            entities = note["entity_set"]
+        else:
+            content = tget("full_text") or tget("text") or ""
+            entities = legacy["entities"]
 
         hashtags = entities.get("hashtags")
         if hashtags:
@@ -302,24 +358,42 @@ class TwitterExtractor(Extractor):
                 "nick": u["name"],
             } for u in mentions]
 
-        content = text.unescape(
-            note["text"] if note else tget("full_text") or tget("text") or "")
+        content = text.unescape(content)
         urls = entities.get("urls")
         if urls:
             for url in urls:
-                content = content.replace(url["url"], url["expanded_url"])
+                try:
+                    content = content.replace(url["url"], url["expanded_url"])
+                except KeyError:
+                    pass
         txt, _, tco = content.rpartition(" ")
         tdata["content"] = txt if tco.startswith("https://t.co/") else content
 
-        if "in_reply_to_screen_name" in tweet:
-            tdata["reply_to"] = tweet["in_reply_to_screen_name"]
-        if "quoted_by" in tweet:
-            tdata["quote_by"] = tweet["quoted_by"]
+        if "birdwatch_pivot" in tweet:
+            try:
+                tdata["birdwatch"] = \
+                    tweet["birdwatch_pivot"]["subtitle"]["text"]
+            except KeyError:
+                self.log.debug("Unable to extract 'birdwatch' note from %s",
+                               tweet["birdwatch_pivot"])
+        if "in_reply_to_screen_name" in legacy:
+            tdata["reply_to"] = legacy["in_reply_to_screen_name"]
+        if "quoted_by" in legacy:
+            tdata["quote_by"] = legacy["quoted_by"]
+        if tdata["retweet_id"]:
+            tdata["content"] = "RT @{}: {}".format(
+                author["name"], tdata["content"])
+            tdata["date_original"] = text.parse_timestamp(
+                ((tdata["retweet_id"] >> 22) + 1288834974657) // 1000)
 
         return tdata
 
     def _transform_user(self, user):
-        uid = user.get("rest_id") or user["id_str"]
+        try:
+            uid = user.get("rest_id") or user["id_str"]
+        except KeyError:
+            # private/invalid user (#4349)
+            return {}
 
         try:
             return self._user_cache[uid]
@@ -328,9 +402,6 @@ class TwitterExtractor(Extractor):
 
         if "legacy" in user:
             user = user["legacy"]
-        elif "statuses_count" not in user and self.syndication == "extended":
-            # try to fetch extended user data
-            user = self.api.user_by_screen_name(user["screen_name"])["legacy"]
 
         uget = user.get
         if uget("withheld_scope"):
@@ -345,6 +416,7 @@ class TwitterExtractor(Extractor):
             "date"            : text.parse_datetime(
                 uget("created_at"), "%a %b %d %H:%M:%S %z %Y"),
             "verified"        : uget("verified", False),
+            "protected"       : uget("protected", False),
             "profile_banner"  : uget("profile_banner_url", ""),
             "profile_image"   : uget(
                 "profile_image_url_https", "").replace("_normal.", "."),
@@ -360,7 +432,10 @@ class TwitterExtractor(Extractor):
         urls = entities["description"].get("urls")
         if urls:
             for url in urls:
-                descr = descr.replace(url["url"], url["expanded_url"])
+                try:
+                    descr = descr.replace(url["url"], url["expanded_url"])
+                except KeyError:
+                    pass
         udata["description"] = descr
 
         if "url" in entities:
@@ -375,9 +450,12 @@ class TwitterExtractor(Extractor):
 
     def _users_result(self, users):
         userfmt = self.config("users")
-        if not userfmt or userfmt == "timeline":
-            cls = TwitterTimelineExtractor
+        if not userfmt or userfmt == "user":
+            cls = TwitterUserExtractor
             fmt = (self.root + "/i/user/{rest_id}").format_map
+        elif userfmt == "timeline":
+            cls = TwitterTimelineExtractor
+            fmt = (self.root + "/id:{rest_id}/timeline").format_map
         elif userfmt == "media":
             cls = TwitterMediaExtractor
             fmt = (self.root + "/id:{rest_id}/media").format_map
@@ -417,6 +495,7 @@ class TwitterExtractor(Extractor):
             "id_str": id_str,
             "lang": None,
             "user": user,
+            "source": "><",
             "entities": {},
             "extended_entities": {
                 "media": [
@@ -428,6 +507,18 @@ class TwitterExtractor(Extractor):
             },
         }
 
+    def _init_cursor(self):
+        cursor = self.config("cursor", True)
+        if not cursor:
+            self._update_cursor = util.identity
+        elif isinstance(cursor, str):
+            return cursor
+
+    def _update_cursor(self, cursor):
+        self.log.debug("Cursor: %s", cursor)
+        self._cursor = cursor
+        return cursor
+
     def metadata(self):
         """Return general metadata"""
         return {}
@@ -435,38 +526,26 @@ class TwitterExtractor(Extractor):
     def tweets(self):
         """Yield all relevant tweet objects"""
 
+    def finalize(self):
+        if self._cursor:
+            self.log.info("Use '-o cursor=%s' to continue downloading "
+                          "from the current position", self._cursor)
+
     def login(self):
-        if not self._check_cookies(self.cookienames):
-            username, password = self._get_auth_info()
-            if username:
-                self._update_cookies(_login_impl(self, username, password))
+        if self.cookies_check(self.cookies_names):
+            return
+
+        username, password = self._get_auth_info()
+        if username:
+            return self.cookies_update(_login_impl(self, username, password))
 
 
-class TwitterTimelineExtractor(TwitterExtractor):
-    """Extractor for a Twitter user timeline"""
-    subcategory = "timeline"
+class TwitterUserExtractor(TwitterExtractor):
+    """Extractor for a Twitter user"""
+    subcategory = "user"
     pattern = (BASE_PATTERN + r"/(?!search)(?:([^/?#]+)/?(?:$|[?#])"
                r"|i(?:/user/|ntent/user\?user_id=)(\d+))")
-    test = (
-        ("https://twitter.com/supernaturepics", {
-            "range": "1-40",
-            "url": "c570ac1aae38ed1463be726cc46f31cac3d82a40",
-        }),
-        # suspended account (#2216)
-        ("https://twitter.com/OptionalTypo", {
-            "exception": exception.NotFoundError,
-        }),
-        # suspended account user ID
-        ("https://twitter.com/id:772949683521978368", {
-            "exception": exception.NotFoundError,
-        }),
-        ("https://mobile.twitter.com/supernaturepics?p=i"),
-        ("https://www.twitter.com/id:2976459548"),
-        ("https://twitter.com/i/user/2976459548"),
-        ("https://twitter.com/intent/user?user_id=2976459548"),
-        ("https://fxtwitter.com/supernaturepics"),
-        ("https://vxtwitter.com/supernaturepics"),
-    )
+    example = "https://x.com/USER"
 
     def __init__(self, match):
         TwitterExtractor.__init__(self, match)
@@ -474,30 +553,106 @@ class TwitterTimelineExtractor(TwitterExtractor):
         if user_id:
             self.user = "id:" + user_id
 
+    def initialize(self):
+        pass
+
+    def finalize(self):
+        pass
+
+    def items(self):
+        base = "{}/{}/".format(self.root, self.user)
+        return self._dispatch_extractors((
+            (TwitterInfoExtractor      , base + "info"),
+            (TwitterAvatarExtractor    , base + "photo"),
+            (TwitterBackgroundExtractor, base + "header_photo"),
+            (TwitterTimelineExtractor  , base + "timeline"),
+            (TwitterTweetsExtractor    , base + "tweets"),
+            (TwitterMediaExtractor     , base + "media"),
+            (TwitterRepliesExtractor   , base + "with_replies"),
+            (TwitterLikesExtractor     , base + "likes"),
+        ), ("timeline",))
+
+
+class TwitterTimelineExtractor(TwitterExtractor):
+    """Extractor for a Twitter user timeline"""
+    subcategory = "timeline"
+    pattern = BASE_PATTERN + r"/(?!search)([^/?#]+)/timeline(?!\w)"
+    example = "https://x.com/USER/timeline"
+
+    def _init_cursor(self):
+        if self._cursor:
+            return self._cursor.partition("/")[2] or None
+        return None
+
+    def _update_cursor(self, cursor):
+        if cursor:
+            self._cursor = self._cursor_prefix + cursor
+            self.log.debug("Cursor: %s", self._cursor)
+        else:
+            self._cursor = None
+        return cursor
+
     def tweets(self):
-        # yield initial batch of (media) tweets
-        tweet = None
-        for tweet in self._select_tweet_source()(self.user):
-            yield tweet
-        if tweet is None:
-            return
+        reset = False
+
+        cursor = self.config("cursor", True)
+        if not cursor:
+            self._update_cursor = util.identity
+        elif isinstance(cursor, str):
+            self._cursor = cursor
+        else:
+            cursor = None
+
+        if cursor:
+            state = cursor.partition("/")[0]
+            state, _, tweet_id = state.partition("_")
+            state = text.parse_int(state, 1)
+        else:
+            state = 1
+
+        if state <= 1:
+            self._cursor_prefix = "1/"
+
+            # yield initial batch of (media) tweets
+            tweet = None
+            for tweet in self._select_tweet_source()(self.user):
+                yield tweet
+            if tweet is None and not cursor:
+                return
+            tweet_id = tweet["rest_id"]
+
+            state = reset = 2
+        else:
+            self.api._user_id_by_screen_name(self.user)
 
         # build search query
-        query = "from:{} max_id:{}".format(
-            self._user["name"], tweet["rest_id"])
+        query = "from:{} max_id:{}".format(self._user["name"], tweet_id)
         if self.retweets:
             query += " include:retweets include:nativeretweets"
 
-        if not self.textonly:
-            # try to search for media-only tweets
-            tweet = None
-            for tweet in self.api.search_adaptive(query + " filter:links"):
-                yield tweet
-            if tweet is not None:
-                return
+        if state <= 2:
+            self._cursor_prefix = "2_{}/".format(tweet_id)
+            if reset:
+                self._cursor = self._cursor_prefix
 
-        # yield unfiltered search results
-        yield from self.api.search_adaptive(query)
+            if not self.textonly:
+                # try to search for media-only tweets
+                tweet = None
+                for tweet in self.api.search_timeline(query + " filter:links"):
+                    yield tweet
+                if tweet is not None:
+                    return self._update_cursor(None)
+
+            state = reset = 3
+
+        if state <= 3:
+            # yield unfiltered search results
+            self._cursor_prefix = "3_{}/".format(tweet_id)
+            if reset:
+                self._cursor = self._cursor_prefix
+
+            yield from self.api.search_timeline(query)
+            return self._update_cursor(None)
 
     def _select_tweet_source(self):
         strategy = self.config("strategy")
@@ -508,23 +663,18 @@ class TwitterTimelineExtractor(TwitterExtractor):
                 return self.api.user_media
         if strategy == "tweets":
             return self.api.user_tweets
+        if strategy == "media":
+            return self.api.user_media
         if strategy == "with_replies":
             return self.api.user_tweets_and_replies
-        return self.api.user_media
+        raise exception.StopExtraction("Invalid strategy '%s'", strategy)
 
 
 class TwitterTweetsExtractor(TwitterExtractor):
     """Extractor for Tweets from a user's Tweets timeline"""
     subcategory = "tweets"
     pattern = BASE_PATTERN + r"/(?!search)([^/?#]+)/tweets(?!\w)"
-    test = (
-        ("https://twitter.com/supernaturepics/tweets", {
-            "range": "1-40",
-            "url": "c570ac1aae38ed1463be726cc46f31cac3d82a40",
-        }),
-        ("https://mobile.twitter.com/supernaturepics/tweets#t"),
-        ("https://www.twitter.com/id:2976459548/tweets"),
-    )
+    example = "https://x.com/USER/tweets"
 
     def tweets(self):
         return self.api.user_tweets(self.user)
@@ -534,14 +684,7 @@ class TwitterRepliesExtractor(TwitterExtractor):
     """Extractor for Tweets from a user's timeline including replies"""
     subcategory = "replies"
     pattern = BASE_PATTERN + r"/(?!search)([^/?#]+)/with_replies(?!\w)"
-    test = (
-        ("https://twitter.com/supernaturepics/with_replies", {
-            "range": "1-40",
-            "url": "c570ac1aae38ed1463be726cc46f31cac3d82a40",
-        }),
-        ("https://mobile.twitter.com/supernaturepics/with_replies#t"),
-        ("https://www.twitter.com/id:2976459548/with_replies"),
-    )
+    example = "https://x.com/USER/with_replies"
 
     def tweets(self):
         return self.api.user_tweets_and_replies(self.user)
@@ -551,14 +694,7 @@ class TwitterMediaExtractor(TwitterExtractor):
     """Extractor for Tweets from a user's Media timeline"""
     subcategory = "media"
     pattern = BASE_PATTERN + r"/(?!search)([^/?#]+)/media(?!\w)"
-    test = (
-        ("https://twitter.com/supernaturepics/media", {
-            "range": "1-40",
-            "url": "c570ac1aae38ed1463be726cc46f31cac3d82a40",
-        }),
-        ("https://mobile.twitter.com/supernaturepics/media#t"),
-        ("https://www.twitter.com/id:2976459548/media"),
-    )
+    example = "https://x.com/USER/media"
 
     def tweets(self):
         return self.api.user_media(self.user)
@@ -568,7 +704,7 @@ class TwitterLikesExtractor(TwitterExtractor):
     """Extractor for liked tweets"""
     subcategory = "likes"
     pattern = BASE_PATTERN + r"/(?!search)([^/?#]+)/likes(?!\w)"
-    test = ("https://twitter.com/supernaturepics/likes",)
+    example = "https://x.com/USER/likes"
 
     def metadata(self):
         return {"user_likes": self.user}
@@ -576,18 +712,12 @@ class TwitterLikesExtractor(TwitterExtractor):
     def tweets(self):
         return self.api.user_likes(self.user)
 
-    def _transform_tweet(self, tweet):
-        tdata = TwitterExtractor._transform_tweet(self, tweet)
-        tdata["date_liked"] = text.parse_timestamp(
-            (int(tweet["sortIndex"]) >> 20) // 1000)
-        return tdata
-
 
 class TwitterBookmarkExtractor(TwitterExtractor):
     """Extractor for bookmarked tweets"""
     subcategory = "bookmark"
     pattern = BASE_PATTERN + r"/i/bookmarks()"
-    test = ("https://twitter.com/i/bookmarks",)
+    example = "https://x.com/i/bookmarks"
 
     def tweets(self):
         return self.api.user_bookmarks()
@@ -595,7 +725,7 @@ class TwitterBookmarkExtractor(TwitterExtractor):
     def _transform_tweet(self, tweet):
         tdata = TwitterExtractor._transform_tweet(self, tweet)
         tdata["date_bookmarked"] = text.parse_timestamp(
-            (int(tweet["sortIndex"]) >> 20) // 1000)
+            (int(tweet["sortIndex"] or 0) >> 20) // 1000)
         return tdata
 
 
@@ -603,11 +733,7 @@ class TwitterListExtractor(TwitterExtractor):
     """Extractor for Twitter lists"""
     subcategory = "list"
     pattern = BASE_PATTERN + r"/i/lists/(\d+)/?$"
-    test = ("https://twitter.com/i/lists/784214683683127296", {
-        "range": "1-40",
-        "count": 40,
-        "archive": False,
-    })
+    example = "https://x.com/i/lists/12345"
 
     def tweets(self):
         return self.api.list_latest_tweets_timeline(self.user)
@@ -617,11 +743,7 @@ class TwitterListMembersExtractor(TwitterExtractor):
     """Extractor for members of a Twitter list"""
     subcategory = "list-members"
     pattern = BASE_PATTERN + r"/i/lists/(\d+)/members"
-    test = ("https://twitter.com/i/lists/784214683683127296/members", {
-        "pattern": TwitterTimelineExtractor.pattern,
-        "range": "1-40",
-        "count": 40,
-    })
+    example = "https://x.com/i/lists/12345/members"
 
     def items(self):
         self.login()
@@ -632,10 +754,7 @@ class TwitterFollowingExtractor(TwitterExtractor):
     """Extractor for followed users"""
     subcategory = "following"
     pattern = BASE_PATTERN + r"/(?!search)([^/?#]+)/following(?!\w)"
-    test = (
-        ("https://twitter.com/supernaturepics/following"),
-        ("https://www.twitter.com/id:2976459548/following"),
-    )
+    example = "https://x.com/USER/following"
 
     def items(self):
         self.login()
@@ -646,11 +765,7 @@ class TwitterSearchExtractor(TwitterExtractor):
     """Extractor for Twitter search results"""
     subcategory = "search"
     pattern = BASE_PATTERN + r"/search/?\?(?:[^&#]+&)*q=([^&#]+)"
-    test = ("https://twitter.com/search?q=nature", {
-        "range": "1-40",
-        "count": 40,
-        "archive": False,
-    })
+    example = "https://x.com/search?q=QUERY"
 
     def metadata(self):
         return {"search": text.unquote(self.user)}
@@ -674,22 +789,41 @@ class TwitterSearchExtractor(TwitterExtractor):
             except KeyError:
                 pass
 
-        return self.api.search_adaptive(query)
+        return self.api.search_timeline(query)
 
 
 class TwitterHashtagExtractor(TwitterExtractor):
     """Extractor for Twitter hashtags"""
     subcategory = "hashtag"
     pattern = BASE_PATTERN + r"/hashtag/([^/?#]+)"
-    test = ("https://twitter.com/hashtag/nature", {
-        "pattern": TwitterSearchExtractor.pattern,
-        "url": "3571c3a53b7647ea35517041fdc17f77ec5b2cb9",
-    })
+    example = "https://x.com/hashtag/NAME"
 
     def items(self):
         url = "{}/search?q=%23{}".format(self.root, self.user)
         data = {"_extractor": TwitterSearchExtractor}
         yield Message.Queue, url, data
+
+
+class TwitterCommunityExtractor(TwitterExtractor):
+    """Extractor for a Twitter community"""
+    subcategory = "community"
+    pattern = BASE_PATTERN + r"/i/communities/(\d+)"
+    example = "https://x.com/i/communities/12345"
+
+    def tweets(self):
+        if self.textonly:
+            return self.api.community_tweets_timeline(self.user)
+        return self.api.community_media_timeline(self.user)
+
+
+class TwitterCommunitiesExtractor(TwitterExtractor):
+    """Extractor for followed Twitter communities"""
+    subcategory = "communities"
+    pattern = BASE_PATTERN + r"/([^/?#]+)/communities/?$"
+    example = "https://x.com/i/communities"
+
+    def tweets(self):
+        return self.api.communities_main_page_timeline(self.user)
 
 
 class TwitterEventExtractor(TwitterExtractor):
@@ -698,10 +832,7 @@ class TwitterEventExtractor(TwitterExtractor):
     directory_fmt = ("{category}", "Events",
                      "{event[id]} {event[short_title]}")
     pattern = BASE_PATTERN + r"/i/events/(\d+)"
-    test = ("https://twitter.com/i/events/1484669206993903616", {
-        "range": "1-20",
-        "count": ">=1",
-    })
+    example = "https://x.com/i/events/12345"
 
     def metadata(self):
         return {"event": self.api.live_event(self.user)}
@@ -711,195 +842,52 @@ class TwitterEventExtractor(TwitterExtractor):
 
 
 class TwitterTweetExtractor(TwitterExtractor):
-    """Extractor for images from individual tweets"""
+    """Extractor for individual tweets"""
     subcategory = "tweet"
-    pattern = BASE_PATTERN + r"/([^/?#]+|i/web)/status/(\d+)"
-    test = (
-        ("https://twitter.com/supernaturepics/status/604341487988576256", {
-            "url": "88a40f7d25529c2501c46f2218f9e0de9aa634b4",
-            "content": "ab05e1d8d21f8d43496df284d31e8b362cd3bcab",
-        }),
-        # 4 images
-        ("https://twitter.com/perrypumas/status/894001459754180609", {
-            "url": "3a2a43dc5fb79dd5432c701d8e55e87c4e551f47",
-        }),
-        # video
-        ("https://twitter.com/perrypumas/status/1065692031626829824", {
-            "pattern": r"https://video.twimg.com/ext_tw_video/.+\.mp4\?tag=5",
-        }),
-        # content with emoji, newlines, hashtags (#338)
-        ("https://twitter.com/playpokemon/status/1263832915173048321", {
-            "keyword": {"content": (
-                r"re:Gear up for #PokemonSwordShieldEX with special Mystery "
-                "Gifts! \n\nYou’ll be able to receive four Galarian form "
-                "Pokémon with Hidden Abilities, plus some very useful items. "
-                "It’s our \\(Mystery\\) Gift to you, Trainers! \n\n❓🎁➡️ "
-            )},
-        }),
-        # Reply to deleted tweet (#403, #838)
-        ("https://twitter.com/i/web/status/1170041925560258560", {
-            "pattern": r"https://pbs.twimg.com/media/EDzS7VrU0AAFL4_",
-        }),
-        # 'replies' option (#705)
-        ("https://twitter.com/i/web/status/1170041925560258560", {
-            "options": (("replies", False),),
-            "count": 0,
-        }),
-        # 'replies' to self (#1254)
-        ("https://twitter.com/i/web/status/1424882930803908612", {
-            "options": (("replies", "self"),),
-            "count": 4,
-            "keyword": {"user": {
-                "description": "re:business email-- rhettaro.bloom@gmail.com "
-                               "patreon- http://patreon.com/Princecanary",
-                "url": "http://princecanary.tumblr.com",
-            }},
-        }),
-        ("https://twitter.com/i/web/status/1424898916156284928", {
-            "options": (("replies", "self"),),
-            "count": 1,
-        }),
-        # "quoted" option (#854)
-        ("https://twitter.com/StobiesGalaxy/status/1270755918330896395", {
-            "options": (("quoted", True),),
-            "pattern": r"https://pbs\.twimg\.com/media/Ea[KG].+=jpg",
-            "count": 8,
-        }),
-        # quoted tweet (#526, #854)
-        ("https://twitter.com/StobiesGalaxy/status/1270755918330896395", {
-            "pattern": r"https://pbs\.twimg\.com/media/EaK.+=jpg",
-            "count": 4,
-        }),
-        # different 'user' and 'author' in quoted Tweet (#3922)
-        ("https://twitter.com/web/status/1644907989109751810", {
-            "keyword": {
-                "author": {"id": 321629993         , "name": "Cakes_Comics"},
-                "user"  : {"id": 718928225360080897, "name": "StobiesGalaxy"},
-            },
-        }),
-        # TwitPic embeds (#579)
-        ("https://twitter.com/i/web/status/112900228289540096", {
-            "options": (("twitpic", True), ("cards", False)),
-            "pattern": r"https://\w+.cloudfront.net/photos/large/\d+.jpg",
-            "count": 3,
-        }),
-        # Twitter card (#1005)
-        ("https://twitter.com/billboard/status/1306599586602135555", {
-            "options": (("cards", True),),
-            "pattern": r"https://pbs.twimg.com/card_img/\d+/",
-        }),
-        # unified_card image_website (#2875)
-        ("https://twitter.com/i/web/status/1561674543323910144", {
-            "options": (("cards", True),),
-            "pattern": r"https://pbs\.twimg\.com/media/F.+=jpg",
-        }),
-        # unified_card image_carousel_website
-        ("https://twitter.com/doax_vv_staff/status/1479438945662685184", {
-            "options": (("cards", True),),
-            "pattern": r"https://pbs\.twimg\.com/media/F.+=png",
-            "count": 6,
-        }),
-        # unified_card video_website (#2875)
-        ("https://twitter.com/bang_dream_1242/status/1561548715348746241", {
-            "options": (("cards", True),),
-            "pattern": r"https://video\.twimg\.com/amplify_video"
-                       r"/1560607284333449216/vid/720x720/\w+\.mp4",
-        }),
-        # unified_card without type
-        ("https://twitter.com/i/web/status/1466183847628865544", {
-            "count": 0,
-        }),
-        # 'cards-blacklist' option
-        ("https://twitter.com/i/web/status/1571141912295243776", {
-            "options": (("cards", "ytdl"),
-                        ("cards-blacklist", ("twitch.tv",))),
-            "count": 0,
-        }),
-        # retweet
-        ("https://twitter.com/jessica_3978/status/1296304589591810048", {
-            "options": (("retweets", True),),
-            "count": 2,
-            "keyword": {
-                "tweet_id"  : 1296304589591810048,
-                "retweet_id": 1296296016002547713,
-                "date"      : "dt:2020-08-20 04:34:32",
-            },
-        }),
-        # original retweets (#1026)
-        ("https://twitter.com/jessica_3978/status/1296304589591810048", {
-            "options": (("retweets", "original"),),
-            "count": 2,
-            "keyword": {
-                "tweet_id"  : 1296296016002547713,
-                "retweet_id": 1296296016002547713,
-                "date"      : "dt:2020-08-20 04:00:28",
-            },
-        }),
-        # all Tweets from a 'conversation' (#1319)
-        ("https://twitter.com/supernaturepics/status/604341487988576256", {
-            "options": (("conversations", True),),
-            "count": 5,
-        }),
-        # retweet with missing media entities (#1555)
-        ("https://twitter.com/morino_ya/status/1392763691599237121", {
-            "options": (("retweets", True),),
-            "count": 0,  # private
-        }),
-        # deleted quote tweet (#2225)
-        ("https://twitter.com/i/web/status/1460044411165888515", {
-            "count": 0,
-        }),
-        # "Misleading" content
-        ("https://twitter.com/i/web/status/1486373748911575046", {
-            "count": 4,
-        }),
-        # age-restricted (#2354)
-        ("https://twitter.com/mightbecursed/status/1492954264909479936", {
-            "options": (("syndication", True),),
-            "keyword": {"date": "dt:2022-02-13 20:10:09"},
-            "count": 1,
-        }),
-        # media alt texts / descriptions (#2617)
-        ("https://twitter.com/my0nruri/status/1528379296041299968", {
-            "keyword": {"description": "oc"}
-        }),
-        # '?format=...&name=...'-style URLs
-        ("https://twitter.com/poco_dandy/status/1150646424461176832", {
-            "options": (("cards", True),),
-            "pattern": r"https://pbs.twimg.com/card_img/157\d+/[\w-]+"
-                       r"\?format=(jpg|png)&name=orig$",
-            "range": "1-2",
-        }),
-        # note tweet with long 'content'
-        ("https://twitter.com/i/web/status/1629193457112686592", {
-            "keyword": {
-                "content": """\
-BREAKING - DEADLY LIES: Independent researchers at Texas A&M University have \
-just contradicted federal government regulators, saying that toxic air \
-pollutants in East Palestine, Ohio, could pose long-term risks. \n\nThe \
-Washington Post writes, "Three weeks after the toxic train derailment in \
-Ohio, an analysis of Environmental Protection Agency data has found nine air \
-pollutants at levels that could raise long-term health concerns in and around \
-East Palestine, according to an independent analysis. \n\n\"The analysis by \
-Texas A&M University seems to contradict statements by state and federal \
-regulators that air near the crash site is completely safe, despite residents \
-complaining about rashes, breathing problems and other health effects." \
-Your reaction.""",
-            },
-        }),
-    )
+    pattern = (BASE_PATTERN + r"/([^/?#]+|i/web)/status/(\d+)"
+               r"/?(?:$|\?|#|photo/|video/)")
+    example = "https://x.com/USER/status/12345"
 
     def __init__(self, match):
         TwitterExtractor.__init__(self, match)
         self.tweet_id = match.group(2)
 
     def tweets(self):
-        if self.config("conversations", False):
+        conversations = self.config("conversations")
+        if conversations:
+            self._accessible = (conversations == "accessible")
             return self._tweets_conversation(self.tweet_id)
-        else:
-            return self._tweets_single(self.tweet_id)
+
+        endpoint = self.config("tweet-endpoint")
+        if endpoint == "detail" or endpoint in (None, "auto") and \
+                self.api.headers["x-twitter-auth-type"]:
+            return self._tweets_detail(self.tweet_id)
+
+        return self._tweets_single(self.tweet_id)
 
     def _tweets_single(self, tweet_id):
+        tweet = self.api.tweet_result_by_rest_id(tweet_id)
+
+        try:
+            self._assign_user(tweet["core"]["user_results"]["result"])
+        except KeyError:
+            raise exception.StopExtraction(
+                "'%s'", tweet.get("reason") or "Unavailable")
+
+        yield tweet
+
+        if not self.quoted:
+            return
+
+        while True:
+            tweet_id = tweet["legacy"].get("quoted_status_id_str")
+            if not tweet_id:
+                break
+            tweet = self.api.tweet_result_by_rest_id(tweet_id)
+            tweet["legacy"]["quoted_by_id_str"] = tweet_id
+            yield tweet
+
+    def _tweets_detail(self, tweet_id):
         tweets = []
 
         for tweet in self.api.tweet_detail(tweet_id):
@@ -925,8 +913,43 @@ Your reaction.""",
                     tweet.get("_retweet_id_str") == tweet_id:
                 self._assign_user(tweet["core"]["user_results"]["result"])
                 break
+        else:
+            # initial Tweet not accessible
+            if self._accessible:
+                return ()
+            return buffer
 
         return itertools.chain(buffer, tweets)
+
+
+class TwitterQuotesExtractor(TwitterExtractor):
+    """Extractor for quotes of a Tweet"""
+    subcategory = "quotes"
+    pattern = BASE_PATTERN + r"/(?:[^/?#]+|i/web)/status/(\d+)/quotes"
+    example = "https://x.com/USER/status/12345/quotes"
+
+    def items(self):
+        url = "{}/search?q=quoted_tweet_id:{}".format(self.root, self.user)
+        data = {"_extractor": TwitterSearchExtractor}
+        yield Message.Queue, url, data
+
+
+class TwitterInfoExtractor(TwitterExtractor):
+    """Extractor for a user's profile data"""
+    subcategory = "info"
+    pattern = BASE_PATTERN + r"/(?!search)([^/?#]+)/info"
+    example = "https://x.com/USER/info"
+
+    def items(self):
+        api = TwitterAPI(self)
+
+        screen_name = self.user
+        if screen_name.startswith("id:"):
+            user = api.user_by_rest_id(screen_name[3:])
+        else:
+            user = api.user_by_screen_name(screen_name)
+
+        return iter(((Message.Directory, self._transform_user(user)),))
 
 
 class TwitterAvatarExtractor(TwitterExtractor):
@@ -934,21 +957,7 @@ class TwitterAvatarExtractor(TwitterExtractor):
     filename_fmt = "avatar {date}.{extension}"
     archive_fmt = "AV_{user[id]}_{date}"
     pattern = BASE_PATTERN + r"/(?!search)([^/?#]+)/photo"
-    test = (
-        ("https://twitter.com/supernaturepics/photo", {
-            "pattern": r"https://pbs\.twimg\.com/profile_images"
-                       r"/554585280938659841/FLVAlX18\.jpeg",
-            "keyword": {
-                "date": "dt:2015-01-12 10:26:49",
-                "extension": "jpeg",
-                "filename": "FLVAlX18",
-                "tweet_id": 554585280938659841,
-            },
-        }),
-        ("https://twitter.com/User16/photo", {
-            "count": 0,
-        }),
-    )
+    example = "https://x.com/USER/photo"
 
     def tweets(self):
         self.api._user_id_by_screen_name(self.user)
@@ -970,20 +979,7 @@ class TwitterBackgroundExtractor(TwitterExtractor):
     filename_fmt = "background {date}.{extension}"
     archive_fmt = "BG_{user[id]}_{date}"
     pattern = BASE_PATTERN + r"/(?!search)([^/?#]+)/header_photo"
-    test = (
-        ("https://twitter.com/supernaturepics/header_photo", {
-            "pattern": r"https://pbs\.twimg\.com/profile_banners"
-                       r"/2976459548/1421058583",
-            "keyword": {
-                "date": "dt:2015-01-12 10:29:43",
-                "filename": "1421058583",
-                "tweet_id": 554586009367478272,
-            },
-        }),
-        ("https://twitter.com/User16/header_photo", {
-            "count": 0,
-        }),
-    )
+    example = "https://x.com/USER/header_photo"
 
     def tweets(self):
         self.api._user_id_by_screen_name(self.user)
@@ -1003,13 +999,7 @@ class TwitterImageExtractor(Extractor):
     category = "twitter"
     subcategory = "image"
     pattern = r"https?://pbs\.twimg\.com/media/([\w-]+)(?:\?format=|\.)(\w+)"
-    test = (
-        ("https://pbs.twimg.com/media/EqcpviCVoAAG-QG?format=jpg&name=orig", {
-            "options": (("size", "4096x4096,orig"),),
-            "url": "cb3042a6f6826923da98f0d2b66c427e9385114c",
-        }),
-        ("https://pbs.twimg.com/media/EqcpviCVoAAG-QG.jpg:orig"),
-    )
+    example = "https://pbs.twimg.com/media/ABCDE?format=jpg&name=orig"
 
     def __init__(self, match):
         Extractor.__init__(self, match)
@@ -1034,38 +1024,41 @@ class TwitterAPI():
 
     def __init__(self, extractor):
         self.extractor = extractor
+        self.log = extractor.log
 
-        self.root = "https://api.twitter.com"
+        self.root = "https://x.com/i/api"
         self._nsfw_warning = True
-        self._syndication = self.extractor.syndication
-        self._json_dumps = json.JSONEncoder(separators=(",", ":")).encode
+        self._json_dumps = util.json_dumps
 
-        cookies = extractor.session.cookies
-        cookiedomain = extractor.cookiedomain
+        cookies = extractor.cookies
+        cookies_domain = extractor.cookies_domain
 
         csrf = extractor.config("csrf")
         if csrf is None or csrf == "cookies":
-            csrf_token = cookies.get("ct0", domain=cookiedomain)
+            csrf_token = cookies.get("ct0", domain=cookies_domain)
         else:
             csrf_token = None
         if not csrf_token:
             csrf_token = util.generate_token()
-            cookies.set("ct0", csrf_token, domain=cookiedomain)
+            cookies.set("ct0", csrf_token, domain=cookies_domain)
 
-        auth_token = cookies.get("auth_token", domain=cookiedomain)
+        auth_token = cookies.get("auth_token", domain=cookies_domain)
 
         self.headers = {
             "Accept": "*/*",
+            "Referer": extractor.root + "/",
+            "content-type": "application/json",
+            "x-guest-token": None,
+            "x-twitter-auth-type": "OAuth2Session" if auth_token else None,
+            "x-csrf-token": csrf_token,
+            "x-twitter-client-language": "en",
+            "x-twitter-active-user": "yes",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
             "authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejR"
                              "COuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu"
                              "4FA33AGWWjCpTnA",
-            "x-guest-token": None,
-            "x-twitter-auth-type": "OAuth2Session" if auth_token else None,
-            "x-twitter-client-language": "en",
-            "x-twitter-active-user": "yes",
-            "x-csrf-token": csrf_token,
-            "Origin": "https://twitter.com",
-            "Referer": "https://twitter.com/",
         }
         self.params = {
             "include_profile_interstitial_type": "1",
@@ -1108,57 +1101,80 @@ class TwitterAPI():
                    "enrichments,superFollowMetadata,unmentionInfo,editControl,"
                    "collab_control,vibe",
         }
-        self.variables = {
-            "withDownvotePerspective": False,
-            "withReactionsMetadata": False,
-            "withReactionsPerspective": False,
-        }
         self.features = {
-            "blue_business_profile_image_shape_enabled": False,
-            "responsive_web_twitter_blue_verified_badge_is_enabled": True,
+            "hidden_profile_likes_enabled": True,
+            "hidden_profile_subscriptions_enabled": True,
             "responsive_web_graphql_exclude_directive_enabled": True,
             "verified_phone_label_enabled": False,
-            "responsive_web_graphql_skip_user_profile_"
-            "image_extensions_enabled": False,
+            "highlights_tweets_tab_ui_enabled": True,
+            "responsive_web_twitter_article_notes_tab_enabled": True,
+            "creator_subscriptions_tweet_preview_api_enabled": True,
+            "responsive_web_graphql_"
+            "skip_user_profile_image_extensions_enabled": False,
             "responsive_web_graphql_timeline_navigation_enabled": True,
         }
         self.features_pagination = {
-            "blue_business_profile_image_shape_enabled": False,
-            "responsive_web_twitter_blue_verified_badge_is_enabled": True,
             "responsive_web_graphql_exclude_directive_enabled": True,
             "verified_phone_label_enabled": False,
+            "creator_subscriptions_tweet_preview_api_enabled": True,
             "responsive_web_graphql_timeline_navigation_enabled": True,
             "responsive_web_graphql_skip_user_profile_"
             "image_extensions_enabled": False,
+            "c9s_tweet_anatomy_moderator_badge_enabled": True,
             "tweetypie_unmention_optimization_enabled": True,
-            "vibe_api_enabled": True,
             "responsive_web_edit_tweet_api_enabled": True,
             "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
             "view_counts_everywhere_api_enabled": True,
             "longform_notetweets_consumption_enabled": True,
+            "responsive_web_twitter_article_tweet_consumption_enabled": True,
             "tweet_awards_web_tipping_enabled": False,
-            "freedom_of_speech_not_reach_fetch_enabled": False,
+            "freedom_of_speech_not_reach_fetch_enabled": True,
             "standardized_nudges_misinfo": True,
             "tweet_with_visibility_results_prefer_gql_"
-            "limited_actions_policy_enabled": False,
-            "interactive_text_enabled": True,
-            "responsive_web_text_conversations_enabled": False,
-            "longform_notetweets_richtext_consumption_enabled": False,
+            "limited_actions_policy_enabled": True,
+            "rweb_video_timestamps_enabled": True,
+            "longform_notetweets_rich_text_read_enabled": True,
+            "longform_notetweets_inline_media_enabled": True,
+            "responsive_web_media_download_video_enabled": True,
             "responsive_web_enhance_cards_enabled": False,
         }
 
+    def tweet_result_by_rest_id(self, tweet_id):
+        endpoint = "/graphql/MWY3AO9_I3rcP_L2A4FR4A/TweetResultByRestId"
+        variables = {
+            "tweetId": tweet_id,
+            "withCommunity": False,
+            "includePromotedContent": False,
+            "withVoice": False,
+        }
+        params = {
+            "variables": self._json_dumps(variables),
+            "features" : self._json_dumps(self.features_pagination),
+        }
+        tweet = self._call(endpoint, params)["data"]["tweetResult"]["result"]
+        if "tweet" in tweet:
+            tweet = tweet["tweet"]
+
+        if tweet.get("__typename") == "TweetUnavailable":
+            reason = tweet.get("reason")
+            if reason == "NsfwLoggedOut":
+                raise exception.AuthorizationError("NSFW Tweet")
+            if reason == "Protected":
+                raise exception.AuthorizationError("Protected Tweet")
+            raise exception.StopExtraction("Tweet unavailable ('%s')", reason)
+
+        return tweet
+
     def tweet_detail(self, tweet_id):
-        endpoint = "/graphql/AV_lPTkN6Fc6LgerQpK8Zg/TweetDetail"
+        endpoint = "/graphql/B9_KmbkLhXt6jRwGjJrweg/TweetDetail"
         variables = {
             "focalTweetId": tweet_id,
             "referrer": "profile",
             "with_rux_injections": False,
-            "includePromotedContent": True,
+            "includePromotedContent": False,
             "withCommunity": True,
             "withQuickPromoteEligibilityTweetFields": True,
-            "withBirdwatchNotes": False,
-            "withSuperFollowsUserFields": True,
-            "withSuperFollowsTweetFields": True,
+            "withBirdwatchNotes": True,
             "withVoice": True,
             "withV2Timeline": True,
         }
@@ -1166,11 +1182,11 @@ class TwitterAPI():
             endpoint, variables, ("threaded_conversation_with_injections_v2",))
 
     def user_tweets(self, screen_name):
-        endpoint = "/graphql/BeHK76TOCY3P8nO-FWocjA/UserTweets"
+        endpoint = "/graphql/5ICa5d9-AitXZrIA3H-4MQ/UserTweets"
         variables = {
             "userId": self._user_id_by_screen_name(screen_name),
             "count": 100,
-            "includePromotedContent": True,
+            "includePromotedContent": False,
             "withQuickPromoteEligibilityTweetFields": True,
             "withVoice": True,
             "withV2Timeline": True,
@@ -1178,11 +1194,11 @@ class TwitterAPI():
         return self._pagination_tweets(endpoint, variables)
 
     def user_tweets_and_replies(self, screen_name):
-        endpoint = "/graphql/eZVlZu_1gwb6hMUDXBnZoQ/UserTweetsAndReplies"
+        endpoint = "/graphql/UtLStR_BnYUGD7Q453UXQg/UserTweetsAndReplies"
         variables = {
             "userId": self._user_id_by_screen_name(screen_name),
             "count": 100,
-            "includePromotedContent": True,
+            "includePromotedContent": False,
             "withCommunity": True,
             "withVoice": True,
             "withV2Timeline": True,
@@ -1190,7 +1206,7 @@ class TwitterAPI():
         return self._pagination_tweets(endpoint, variables)
 
     def user_media(self, screen_name):
-        endpoint = "/graphql/d_ONZLUHGCsErBCriRsLXg/UserMedia"
+        endpoint = "/graphql/tO4LMUYAZbR4T0SqQ85aAw/UserMedia"
         variables = {
             "userId": self._user_id_by_screen_name(screen_name),
             "count": 100,
@@ -1202,28 +1218,8 @@ class TwitterAPI():
         }
         return self._pagination_tweets(endpoint, variables)
 
-    def user_media_legacy(self, screen_name):
-        endpoint = "/graphql/nRybED9kRbN-TOWioHq1ng/UserMedia"
-        variables = {
-            "userId": self._user_id_by_screen_name(screen_name),
-            "count": 100,
-            "includePromotedContent": False,
-            "withSuperFollowsUserFields": True,
-            "withBirdwatchPivots": False,
-            "withSuperFollowsTweetFields": True,
-            "withClientEventToken": False,
-            "withBirdwatchNotes": False,
-            "withVoice": True,
-            "withV2Timeline": False,
-            "__fs_interactive_text": False,
-            "__fs_dont_mention_me_view_api_enabled": False,
-        }
-        return self._pagination_tweets(
-            endpoint, variables, ("user", "result", "timeline", "timeline"),
-            features=False)
-
     def user_likes(self, screen_name):
-        endpoint = "/graphql/fN4-E0MjFJ9Cn7IYConL7g/Likes"
+        endpoint = "/graphql/9s8V6sUI8fZLDiN-REkAxA/Likes"
         variables = {
             "userId": self._user_id_by_screen_name(screen_name),
             "count": 100,
@@ -1236,9 +1232,10 @@ class TwitterAPI():
         return self._pagination_tweets(endpoint, variables)
 
     def user_bookmarks(self):
-        endpoint = "/graphql/RV1g3b8n_SGOHwkqKYSCFw/Bookmarks"
+        endpoint = "/graphql/cQxQgX8MJYjWwC0dxpyfYg/Bookmarks"
         variables = {
             "count": 100,
+            "includePromotedContent": False,
         }
         features = self.features_pagination.copy()
         features["graphql_timeline_v2_bookmark_timeline"] = True
@@ -1247,7 +1244,7 @@ class TwitterAPI():
             features=features)
 
     def list_latest_tweets_timeline(self, list_id):
-        endpoint = "/graphql/5DAiJG3bD77SiWEs4xViBw/ListLatestTweetsTimeline"
+        endpoint = "/graphql/HjsWc-nwwHKYwHenbHm-tw/ListLatestTweetsTimeline"
         variables = {
             "listId": list_id,
             "count": 100,
@@ -1255,15 +1252,55 @@ class TwitterAPI():
         return self._pagination_tweets(
             endpoint, variables, ("list", "tweets_timeline", "timeline"))
 
-    def search_adaptive(self, query):
-        endpoint = "/2/search/adaptive.json"
-        params = self.params.copy()
-        params["q"] = query
-        params["tweet_search_mode"] = "live"
-        params["query_source"] = "typed_query"
-        params["pc"] = "1"
-        params["spelling_corrections"] = "1"
-        return self._pagination_legacy(endpoint, params)
+    def search_timeline(self, query):
+        endpoint = "/graphql/fZK7JipRHWtiZsTodhsTfQ/SearchTimeline"
+        variables = {
+            "rawQuery": query,
+            "count": 100,
+            "querySource": "",
+            "product": "Latest",
+        }
+
+        return self._pagination_tweets(
+            endpoint, variables,
+            ("search_by_raw_query", "search_timeline", "timeline"))
+
+    def community_tweets_timeline(self, community_id):
+        endpoint = "/graphql/7B2AdxSuC-Er8qUr3Plm_w/CommunityTweetsTimeline"
+        variables = {
+            "communityId": community_id,
+            "count": 100,
+            "displayLocation": "Community",
+            "rankingMode": "Recency",
+            "withCommunity": True,
+        }
+        return self._pagination_tweets(
+            endpoint, variables,
+            ("communityResults", "result", "ranked_community_timeline",
+             "timeline"))
+
+    def community_media_timeline(self, community_id):
+        endpoint = "/graphql/qAGUldfcIoMv5KyAyVLYog/CommunityMediaTimeline"
+        variables = {
+            "communityId": community_id,
+            "count": 100,
+            "withCommunity": True,
+        }
+        return self._pagination_tweets(
+            endpoint, variables,
+            ("communityResults", "result", "community_media_timeline",
+             "timeline"))
+
+    def communities_main_page_timeline(self, screen_name):
+        endpoint = ("/graphql/GtOhw2mstITBepTRppL6Uw"
+                    "/CommunitiesMainPageTimeline")
+        variables = {
+            "count": 100,
+            "withCommunity": True,
+        }
+        return self._pagination_tweets(
+            endpoint, variables,
+            ("viewer", "communities_timeline", "timeline"))
 
     def live_event_timeline(self, event_id):
         endpoint = "/2/live_event/timeline/{}.json".format(event_id)
@@ -1281,22 +1318,8 @@ class TwitterAPI():
         return (self._call(endpoint, params)
                 ["twitter_objects"]["live_events"][event_id])
 
-    def list_by_rest_id(self, list_id):
-        endpoint = "/graphql/D0EoyrDcct2MEqC-LnPzFg/ListByRestId"
-        params = {
-            "variables": self._json_dumps({
-                "listId": list_id,
-                "withSuperFollowsUserFields": True,
-            }),
-            "features": self._json_dumps(self.features),
-        }
-        try:
-            return self._call(endpoint, params)["data"]["list"]
-        except KeyError:
-            raise exception.NotFoundError("list")
-
     def list_members(self, list_id):
-        endpoint = "/graphql/tzsIIbGUH9RyFCVmtO2W2w/ListMembers"
+        endpoint = "/graphql/BQp2IEYkgxuSxqbTAr1e1g/ListMembers"
         variables = {
             "listId": list_id,
             "count": 100,
@@ -1306,7 +1329,7 @@ class TwitterAPI():
             endpoint, variables, ("list", "members_timeline", "timeline"))
 
     def user_following(self, screen_name):
-        endpoint = "/graphql/FaBzCqZXuQCb4PhB0RHqHw/Following"
+        endpoint = "/graphql/PAnE9toEjRfE-4tozRcsfw/Following"
         variables = {
             "userId": self._user_id_by_screen_name(screen_name),
             "count": 100,
@@ -1314,25 +1337,33 @@ class TwitterAPI():
         }
         return self._pagination_users(endpoint, variables)
 
+    @memcache(keyarg=1)
     def user_by_rest_id(self, rest_id):
-        endpoint = "/graphql/S2BkcAyFMG--jef2N6Dgzw/UserByRestId"
+        endpoint = "/graphql/tD8zKvQzwY3kdx5yz6YmOw/UserByRestId"
+        features = self.features
         params = {
             "variables": self._json_dumps({
                 "userId": rest_id,
                 "withSafetyModeUserFields": True,
             }),
-            "features": self._json_dumps(self.features),
+            "features": self._json_dumps(features),
         }
         return self._call(endpoint, params)["data"]["user"]["result"]
 
+    @memcache(keyarg=1)
     def user_by_screen_name(self, screen_name):
-        endpoint = "/graphql/k26ASEiniqy4eXMdknTSoQ/UserByScreenName"
+        endpoint = "/graphql/k5XapwcSikNsEsILW5FvgA/UserByScreenName"
+        features = self.features.copy()
+        features["subscriptions_verification_info_"
+                 "is_identity_verified_enabled"] = True
+        features["subscriptions_verification_info_"
+                 "verified_since_enabled"] = True
         params = {
             "variables": self._json_dumps({
                 "screen_name": screen_name,
                 "withSafetyModeUserFields": True,
             }),
-            "features": self._json_dumps(self.features),
+            "features": self._json_dumps(features),
         }
         return self._call(endpoint, params)["data"]["user"]["result"]
 
@@ -1356,18 +1387,20 @@ class TwitterAPI():
     @cache(maxage=3600)
     def _guest_token(self):
         endpoint = "/1.1/guest/activate.json"
-        self.extractor.log.info("Requesting guest token")
-        return str(self._call(endpoint, None, "POST", False)["guest_token"])
+        self.log.info("Requesting guest token")
+        return str(self._call(
+            endpoint, None, "POST", False, "https://api.x.com",
+        )["guest_token"])
 
     def _authenticate_guest(self):
         guest_token = self._guest_token()
         if guest_token != self.headers["x-guest-token"]:
             self.headers["x-guest-token"] = guest_token
-            self.extractor.session.cookies.set(
-                "gt", guest_token, domain=self.extractor.cookiedomain)
+            self.extractor.cookies.set(
+                "gt", guest_token, domain=self.extractor.cookies_domain)
 
-    def _call(self, endpoint, params, method="GET", auth=True):
-        url = self.root + endpoint
+    def _call(self, endpoint, params, method="GET", auth=True, root=None):
+        url = (root or self.root) + endpoint
 
         while True:
             if not self.headers["x-twitter-auth-type"] and auth:
@@ -1382,31 +1415,82 @@ class TwitterAPI():
             if csrf_token:
                 self.headers["x-csrf-token"] = csrf_token
 
-            if response.status_code < 400:
-                # success
-                return response.json()
+            remaining = int(response.headers.get("x-rate-limit-remaining", 6))
+            if remaining < 6 and remaining <= random.randrange(1, 6):
+                self._handle_ratelimit(response)
+                continue
 
-            if response.status_code == 429:
-                # rate limit exceeded
-                until = response.headers.get("x-rate-limit-reset")
-                seconds = None if until else 60
-                self.extractor.wait(until=until, seconds=seconds)
+            try:
+                data = response.json()
+            except ValueError:
+                data = {"errors": ({"message": response.text},)}
+
+            errors = data.get("errors")
+            if not errors:
+                return data
+
+            retry = False
+            for error in errors:
+                msg = error.get("message") or "Unspecified"
+                self.log.debug("API error: '%s'", msg)
+
+                if "this account is temporarily locked" in msg:
+                    msg = "Account temporarily locked"
+                    if self.extractor.config("locked") != "wait":
+                        raise exception.AuthorizationError(msg)
+                    self.log.warning(msg)
+                    self.extractor.input("Press ENTER to retry.")
+                    retry = True
+
+                elif "Could not authenticate you" in msg:
+                    if not self.extractor.config("relogin", True):
+                        continue
+
+                    username, password = self.extractor._get_auth_info()
+                    if not username:
+                        continue
+
+                    _login_impl.invalidate(username)
+                    self.extractor.cookies_update(
+                        _login_impl(self.extractor, username, password))
+                    self.__init__(self.extractor)
+                    retry = True
+
+                elif msg.lower().startswith("timeout"):
+                    retry = True
+
+            if retry:
+                if self.headers["x-twitter-auth-type"]:
+                    self.log.debug("Retrying API request")
+                    continue
+                else:
+                    # fall through to "Login Required"
+                    response.status_code = 404
+
+            if response.status_code < 400:
+                return data
+            elif response.status_code in (403, 404) and \
+                    not self.headers["x-twitter-auth-type"]:
+                raise exception.AuthorizationError("Login required")
+            elif response.status_code == 429:
+                self._handle_ratelimit(response)
                 continue
 
             # error
             try:
-                data = response.json()
-                errors = ", ".join(e["message"] for e in data["errors"])
-            except ValueError:
-                errors = response.text
+                errors = ", ".join(e["message"] for e in errors)
             except Exception:
-                errors = data.get("errors", "")
+                pass
 
             raise exception.StopExtraction(
                 "%s %s (%s)", response.status_code, response.reason, errors)
 
     def _pagination_legacy(self, endpoint, params):
-        original_retweets = (self.extractor.retweets == "original")
+        extr = self.extractor
+        cursor = extr._init_cursor()
+        if cursor:
+            params["cursor"] = cursor
+        original_retweets = (extr.retweets == "original")
         bottom = ("cursor-bottom-", "sq-cursor-bottom")
 
         while True:
@@ -1414,7 +1498,7 @@ class TwitterAPI():
 
             instructions = data["timeline"]["instructions"]
             if not instructions:
-                return
+                return extr._update_cursor(None)
 
             tweets = data["globalObjects"]["tweets"]
             users = data["globalObjects"]["users"]
@@ -1464,7 +1548,7 @@ class TwitterAPI():
                 try:
                     tweet = tweets[tweet_id]
                 except KeyError:
-                    self.extractor.log.debug("Skipping %s (deleted)", tweet_id)
+                    self.log.debug("Skipping %s (deleted)", tweet_id)
                     continue
 
                 if "retweeted_status_id_str" in tweet:
@@ -1495,17 +1579,19 @@ class TwitterAPI():
 
             # stop on empty response
             if not cursor or (not tweets and not tweet_id):
-                return
-            params["cursor"] = cursor
+                return extr._update_cursor(None)
+            params["cursor"] = extr._update_cursor(cursor)
 
     def _pagination_tweets(self, endpoint, variables,
                            path=None, stop_tweets=True, features=None):
         extr = self.extractor
-        variables.update(self.variables)
         original_retweets = (extr.retweets == "original")
         pinned_tweet = extr.pinned
 
         params = {"variables": None}
+        cursor = extr._init_cursor()
+        if cursor:
+            variables["cursor"] = cursor
         if features is None:
             features = self.features_pagination
         if features:
@@ -1525,12 +1611,28 @@ class TwitterAPI():
                         instructions = instructions[key]
                     instructions = instructions["instructions"]
 
+                cursor = None
+                entries = None
                 for instr in instructions:
-                    if instr.get("type") == "TimelineAddEntries":
-                        entries = instr["entries"]
-                        break
-                else:
-                    raise KeyError()
+                    instr_type = instr.get("type")
+                    if instr_type == "TimelineAddEntries":
+                        if entries:
+                            entries.extend(instr["entries"])
+                        else:
+                            entries = instr["entries"]
+                    elif instr_type == "TimelineAddToModule":
+                        entries = instr["moduleItems"]
+                    elif instr_type == "TimelinePinEntry":
+                        if pinned_tweet:
+                            pinned_tweet = instr["entry"]
+                    elif instr_type == "TimelineReplaceEntry":
+                        entry = instr["entry"]
+                        if entry["entryId"].startswith("cursor-bottom-"):
+                            cursor = entry["content"]["value"]
+                if entries is None:
+                    if not cursor:
+                        return extr._update_cursor(None)
+                    entries = ()
 
             except LookupError:
                 extr.log.debug(data)
@@ -1541,8 +1643,8 @@ class TwitterAPI():
                     if user.get("blocked_by"):
                         if self.headers["x-twitter-auth-type"] and \
                                 extr.config("logout"):
-                            extr._cookiefile = None
-                            del extr.session.cookies["auth_token"]
+                            extr.cookies_file = None
+                            del extr.cookies["auth_token"]
                             self.headers["x-twitter-auth-type"] = None
                             extr.log.info("Retrying API request as guest")
                             continue
@@ -1558,18 +1660,26 @@ class TwitterAPI():
                     "Unable to retrieve Tweets from this timeline")
 
             tweets = []
-            tweet = cursor = None
+            tweet = None
 
             if pinned_tweet:
-                pinned_tweet = False
-                if instructions[-1]["type"] == "TimelinePinEntry":
+                if isinstance(pinned_tweet, dict):
+                    tweets.append(pinned_tweet)
+                elif instructions[-1]["type"] == "TimelinePinEntry":
                     tweets.append(instructions[-1]["entry"])
+                pinned_tweet = False
 
             for entry in entries:
                 esw = entry["entryId"].startswith
 
                 if esw("tweet-"):
                     tweets.append(entry)
+                elif esw(("profile-grid-",
+                          "communities-grid-")):
+                    if "content" in entry:
+                        tweets.extend(entry["content"]["items"])
+                    else:
+                        tweets.append(entry)
                 elif esw(("homeConversation-",
                           "profile-conversation-",
                           "conversationthread-")):
@@ -1590,13 +1700,21 @@ class TwitterAPI():
 
             for entry in tweets:
                 try:
-                    tweet = ((entry.get("content") or entry["item"])
-                             ["itemContent"]["tweet_results"]["result"])
+                    item = ((entry.get("content") or entry["item"])
+                            ["itemContent"])
+                    if "promotedMetadata" in item and not extr.ads:
+                        extr.log.debug(
+                            "Skipping %s (ad)",
+                            (entry.get("entryId") or "").rpartition("-")[2])
+                        continue
+
+                    tweet = item["tweet_results"]["result"]
                     if "tombstone" in tweet:
                         tweet = self._process_tombstone(
                             entry, tweet["tombstone"])
                         if not tweet:
                             continue
+
                     if "tweet" in tweet:
                         tweet = tweet["tweet"]
                     legacy = tweet["legacy"]
@@ -1627,15 +1745,21 @@ class TwitterAPI():
                                 retweet["core"]["user_results"]["result"]
 
                             rtlegacy = retweet["legacy"]
+
+                            if "note_tweet" in retweet:
+                                tweet["note_tweet"] = retweet["note_tweet"]
+
                             if "extended_entities" in rtlegacy and \
                                     "extended_entities" not in legacy:
                                 legacy["extended_entities"] = \
                                     rtlegacy["extended_entities"]
+
                             if "withheld_scope" in rtlegacy and \
                                     "withheld_scope" not in legacy:
                                 legacy["withheld_scope"] = \
                                     rtlegacy["withheld_scope"]
-                                legacy["full_text"] = rtlegacy["full_text"]
+
+                            legacy["full_text"] = rtlegacy["full_text"]
                         except KeyError:
                             pass
 
@@ -1658,18 +1782,23 @@ class TwitterAPI():
                         continue
 
             if stop_tweets and not tweet:
-                return
+                return extr._update_cursor(None)
             if not cursor or cursor == variables.get("cursor"):
-                return
-            variables["cursor"] = cursor
+                return extr._update_cursor(None)
+            variables["cursor"] = extr._update_cursor(cursor)
 
     def _pagination_users(self, endpoint, variables, path=None):
-        variables.update(self.variables)
-        params = {"variables": None,
-                  "features" : self._json_dumps(self.features_pagination)}
+        extr = self.extractor
+        cursor = extr._init_cursor()
+        if cursor:
+            variables["cursor"] = cursor
+        params = {
+            "variables": None,
+            "features" : self._json_dumps(self.features_pagination),
+        }
 
         while True:
-            cursor = entry = stop = None
+            cursor = entry = None
             params["variables"] = self._json_dumps(variables)
             data = self._call(endpoint, params)["data"]
 
@@ -1682,7 +1811,7 @@ class TwitterAPI():
                         data = data[key]
                     instructions = data["instructions"]
             except KeyError:
-                return
+                return extr._update_cursor(None)
 
             for instr in instructions:
                 if instr["type"] == "TimelineAddEntries":
@@ -1698,100 +1827,59 @@ class TwitterAPI():
                                     yield user
                         elif entry["entryId"].startswith("cursor-bottom-"):
                             cursor = entry["content"]["value"]
-                elif instr["type"] == "TimelineTerminateTimeline":
-                    if instr["direction"] == "Bottom":
-                        stop = True
 
-            if stop or not cursor or not entry:
-                return
-            variables["cursor"] = cursor
+            if not cursor or cursor.startswith(("-1|", "0|")) or not entry:
+                return extr._update_cursor(None)
+            variables["cursor"] = extr._update_cursor(cursor)
+
+    def _handle_ratelimit(self, response):
+        rl = self.extractor.config("ratelimit")
+        if rl == "abort":
+            raise exception.StopExtraction("Rate limit exceeded")
+        elif rl and isinstance(rl, str) and rl.startswith("wait:"):
+            until = None
+            seconds = text.parse_float(rl.partition(":")[2]) or 60.0
+        else:
+            until = response.headers.get("x-rate-limit-reset")
+            seconds = None if until else 60.0
+        self.extractor.wait(until=until, seconds=seconds)
 
     def _process_tombstone(self, entry, tombstone):
         text = (tombstone.get("richText") or tombstone["text"])["text"]
         tweet_id = entry["entryId"].rpartition("-")[2]
 
         if text.startswith("Age-restricted"):
-            if self._syndication:
-                return self._syndication_tweet(tweet_id)
-            elif self._nsfw_warning:
+            if self._nsfw_warning:
                 self._nsfw_warning = False
-                self.extractor.log.warning('"%s"', text)
+                self.log.warning('"%s"', text)
 
-        self.extractor.log.debug("Skipping %s (\"%s\")", tweet_id, text)
-
-    def _syndication_tweet(self, tweet_id):
-        base_url = "https://cdn.syndication.twimg.com/tweet-result?id="
-        tweet = self.extractor.request(base_url + tweet_id).json()
-
-        tweet["user"]["description"] = ""
-        tweet["user"]["entities"] = {"description": {}}
-        tweet["user_id_str"] = tweet["user"]["id_str"]
-
-        if tweet["id_str"] != tweet_id:
-            tweet["retweeted_status_id_str"] = tweet["id_str"]
-            tweet["id_str"] = retweet_id = tweet_id
-        else:
-            retweet_id = None
-
-        # assume 'conversation_id' is the same as 'id' when the tweet
-        # is not a reply
-        if "conversation_id_str" not in tweet and \
-                "in_reply_to_status_id_str" not in tweet:
-            tweet["conversation_id_str"] = tweet["id_str"]
-
-        if int(tweet_id) < 300000000000000:
-            tweet["created_at"] = text.parse_datetime(
-                tweet["created_at"], "%Y-%m-%dT%H:%M:%S.%fZ").strftime(
-                "%a %b %d %H:%M:%S +0000 %Y")
-
-        if "video" in tweet:
-            video = tweet["video"]
-            video["variants"] = (max(
-                (v for v in video["variants"] if v["type"] == "video/mp4"),
-                key=lambda v: text.parse_int(
-                    v["src"].split("/")[-2].partition("x")[0])
-            ),)
-            video["variants"][0]["url"] = video["variants"][0]["src"]
-            tweet["extended_entities"] = {"media": [{
-                "video_info"   : video,
-                "original_info": {"width" : 0, "height": 0},
-            }]}
-        elif "photos" in tweet:
-            for p in tweet["photos"]:
-                p["media_url_https"] = p["url"]
-                p["original_info"] = {
-                    "width" : p["width"],
-                    "height": p["height"],
-                }
-            tweet["extended_entities"] = {"media": tweet["photos"]}
-
-        return {
-            "rest_id": tweet["id_str"],
-            "legacy" : tweet,
-            "core"   : {"user_results": {"result": tweet["user"]}},
-            "_retweet_id_str": retweet_id,
-        }
+        self.log.debug("Skipping %s ('%s')", tweet_id, text)
 
 
-@cache(maxage=360*86400, keyarg=1)
+@cache(maxage=365*86400, keyarg=1)
 def _login_impl(extr, username, password):
 
-    import re
-    import random
+    def process(data, params=None):
+        response = extr.request(
+            url, params=params, headers=headers, json=data,
+            method="POST", fatal=None)
 
-    if re.fullmatch(r"[\w.%+-]+@[\w.-]+\.\w{2,}", username):
-        extr.log.warning(
-            "Login with email is no longer possible. "
-            "You need to provide your username or phone number instead.")
+        # update 'x-csrf-token' header (#5945)
+        csrf_token = response.cookies.get("ct0")
+        if csrf_token:
+            headers["x-csrf-token"] = csrf_token
 
-    def process(response):
         try:
             data = response.json()
         except ValueError:
             data = {"errors": ({"message": "Invalid response"},)}
         else:
             if response.status_code < 400:
-                return data["flow_token"]
+                try:
+                    return (data["flow_token"],
+                            data["subtasks"][0]["subtask_id"])
+                except LookupError:
+                    pass
 
         errors = []
         for error in data.get("errors") or ():
@@ -1800,9 +1888,13 @@ def _login_impl(extr, username, password):
         extr.log.debug(response.text)
         raise exception.AuthenticationError(", ".join(errors))
 
-    extr.session.cookies.clear()
+    cookies = extr.cookies
+    cookies.clear()
     api = TwitterAPI(extr)
     api._authenticate_guest()
+
+    url = "https://api.x.com/1.1/onboarding/task.json"
+    params = {"flow_name": "login"}
     headers = api.headers
 
     extr.log.info("Logging in as %s", username)
@@ -1859,31 +1951,18 @@ def _login_impl(extr, username, password):
             "web_modal": 1,
         },
     }
-    url = "https://api.twitter.com/1.1/onboarding/task.json?flow_name=login"
-    response = extr.request(url, method="POST", headers=headers, json=data)
 
-    data = {
-        "flow_token": process(response),
-        "subtask_inputs": [
-            {
-                "subtask_id": "LoginJsInstrumentationSubtask",
+    flow_token, subtask = process(data, params)
+    while not cookies.get("auth_token"):
+        if subtask == "LoginJsInstrumentationSubtask":
+            data = {
                 "js_instrumentation": {
                     "response": "{}",
                     "link": "next_link",
                 },
-            },
-        ],
-    }
-    url = "https://api.twitter.com/1.1/onboarding/task.json"
-    response = extr.request(
-        url, method="POST", headers=headers, json=data, fatal=None)
-
-    # username
-    data = {
-        "flow_token": process(response),
-        "subtask_inputs": [
-            {
-                "subtask_id": "LoginEnterUserIdentifierSSO",
+            }
+        elif subtask == "LoginEnterUserIdentifierSSO":
+            data = {
                 "settings_list": {
                     "setting_responses": [
                         {
@@ -1895,50 +1974,64 @@ def _login_impl(extr, username, password):
                     ],
                     "link": "next_link",
                 },
-            },
-        ],
-    }
-    #  url = "https://api.twitter.com/1.1/onboarding/task.json"
-    extr.sleep(random.uniform(2.0, 4.0), "login (username)")
-    response = extr.request(
-        url, method="POST", headers=headers, json=data, fatal=None)
-
-    # password
-    data = {
-        "flow_token": process(response),
-        "subtask_inputs": [
-            {
-                "subtask_id": "LoginEnterPassword",
+            }
+        elif subtask == "LoginEnterPassword":
+            data = {
                 "enter_password": {
                     "password": password,
                     "link": "next_link",
                 },
-            },
-        ],
-    }
-    #  url = "https://api.twitter.com/1.1/onboarding/task.json"
-    extr.sleep(random.uniform(2.0, 4.0), "login (password)")
-    response = extr.request(
-        url, method="POST", headers=headers, json=data, fatal=None)
-
-    # account duplication check ?
-    data = {
-        "flow_token": process(response),
-        "subtask_inputs": [
-            {
-                "subtask_id": "AccountDuplicationCheck",
+            }
+        elif subtask == "LoginEnterAlternateIdentifierSubtask":
+            alt = extr.config("username-alt") or extr.input(
+                "Alternate Identifier (username, email, phone number): ")
+            data = {
+                "enter_text": {
+                    "text": alt,
+                    "link": "next_link",
+                },
+            }
+        elif subtask == "LoginTwoFactorAuthChallenge":
+            data = {
+                "enter_text": {
+                    "text": extr.input("2FA Token: "),
+                    "link": "next_link",
+                },
+            }
+        elif subtask == "LoginAcid":
+            data = {
+                "enter_text": {
+                    "text": extr.input("Email Verification Code: "),
+                    "link": "next_link",
+                },
+            }
+        elif subtask == "AccountDuplicationCheck":
+            data = {
                 "check_logged_in_account": {
                     "link": "AccountDuplicationCheck_false",
                 },
-            },
-        ],
-    }
-    #  url = "https://api.twitter.com/1.1/onboarding/task.json"
-    response = extr.request(
-        url, method="POST", headers=headers, json=data, fatal=None)
-    process(response)
+            }
+        elif subtask == "ArkoseLogin":
+            raise exception.AuthenticationError("Login requires CAPTCHA")
+        elif subtask == "DenyLoginSubtask":
+            raise exception.AuthenticationError("Login rejected as suspicious")
+        elif subtask == "LoginSuccessSubtask":
+            raise exception.AuthenticationError(
+                "No 'auth_token' cookie received")
+        else:
+            raise exception.StopExtraction("Unrecognized subtask %s", subtask)
+
+        inputs = {"subtask_id": subtask}
+        inputs.update(data)
+        data = {
+            "flow_token": flow_token,
+            "subtask_inputs": [inputs],
+        }
+
+        extr.sleep(random.uniform(1.0, 3.0), "login ({})".format(subtask))
+        flow_token, subtask = process(data)
 
     return {
         cookie.name: cookie.value
-        for cookie in extr.session.cookies
+        for cookie in extr.cookies
     }

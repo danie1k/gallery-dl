@@ -19,20 +19,28 @@ class PatreonExtractor(Extractor):
     """Base class for patreon extractors"""
     category = "patreon"
     root = "https://www.patreon.com"
-    cookiedomain = ".patreon.com"
+    cookies_domain = ".patreon.com"
     directory_fmt = ("{category}", "{creator[full_name]}")
     filename_fmt = "{id}_{title}_{num:>02}.{extension}"
     archive_fmt = "{id}_{num}"
-    browser = "firefox"
-    tls12 = False
+    useragent = "Patreon/72.2.28 (Android; Android 14; Scale/2.10)"
     _warning = True
 
-    def items(self):
-
-        if self._warning:
-            if not self._check_cookies(("session_id",)):
+    def _init(self):
+        if not self.cookies_check(("session_id",)):
+            if self._warning:
+                PatreonExtractor._warning = False
                 self.log.warning("no 'session_id' cookie set")
-            PatreonExtractor._warning = False
+            if self.session.headers["User-Agent"] is self.useragent:
+                self.session.headers["User-Agent"] = \
+                    "Patreon/7.6.28 (Android; Android 11; Scale/2.10)"
+
+        format_images = self.config("format-images")
+        if format_images:
+            self._images_fmt = format_images
+            self._images_url = self._images_url_fmt
+
+    def items(self):
         generators = self._build_file_generators(self.config("files"))
 
         for post in self.posts():
@@ -52,23 +60,43 @@ class PatreonExtractor(Extractor):
                     post["hash"] = fhash
                     post["type"] = kind
                     post["num"] += 1
-                    yield Message.Url, url, text.nameext_from_url(name, post)
+                    text.nameext_from_url(name, post)
+                    if text.ext_from_url(url) == "m3u8":
+                        url = "ytdl:" + url
+                        post["_ytdl_manifest"] = "hls"
+                        post["extension"] = "mp4"
+                    yield Message.Url, url, post
                 else:
                     self.log.debug("skipping %s (%s %s)", url, fhash, kind)
 
-    @staticmethod
-    def _postfile(post):
+    def _postfile(self, post):
         postfile = post.get("post_file")
         if postfile:
-            return (("postfile", postfile["url"], postfile["name"]),)
+            url = postfile["url"]
+            name = postfile.get("name")
+            if not name:
+                if url.startswith("https://stream.mux.com/"):
+                    name = url
+                else:
+                    name = self._filename(url) or url
+            return (("postfile", url, name),)
         return ()
 
     def _images(self, post):
-        for image in post["images"]:
-            url = image.get("download_url")
+        for image in post.get("images") or ():
+            url = self._images_url(image)
             if url:
                 name = image.get("file_name") or self._filename(url) or url
                 yield "image", url, name
+
+    def _images_url(self, image):
+        return image.get("download_url")
+
+    def _images_url_fmt(self, image):
+        try:
+            return image["image_urls"][self._images_fmt]
+        except Exception:
+            return image.get("download_url")
 
     def _image_large(self, post):
         image = post.get("image")
@@ -80,7 +108,7 @@ class PatreonExtractor(Extractor):
         return ()
 
     def _attachments(self, post):
-        for attachment in post["attachments"]:
+        for attachment in post.get("attachments") or ():
             url = self.request(
                 attachment["url"], method="HEAD",
                 allow_redirects=False, fatal=False,
@@ -88,6 +116,11 @@ class PatreonExtractor(Extractor):
 
             if url:
                 yield "attachment", url, attachment["name"]
+
+        for attachment in post.get("attachments_media") or ():
+            url = attachment.get("download_url")
+            if url:
+                yield "attachment", url, attachment["file_name"]
 
     def _content(self, post):
         content = post.get("content")
@@ -103,7 +136,6 @@ class PatreonExtractor(Extractor):
 
     def _pagination(self, url):
         headers = {
-            "Referer"     : self.root + "/",
             "Content-Type": "application/vnd.api+json",
         }
 
@@ -128,8 +160,12 @@ class PatreonExtractor(Extractor):
         if attr.get("current_user_can_view", True):
 
             relationships = post["relationships"]
-            attr["images"] = self._files(post, included, "images")
-            attr["attachments"] = self._files(post, included, "attachments")
+            attr["images"] = self._files(
+                post, included, "images")
+            attr["attachments"] = self._files(
+                post, included, "attachments")
+            attr["attachments_media"] = self._files(
+                post, included, "attachments_media")
             attr["date"] = text.parse_datetime(
                 attr["published_at"], "%Y-%m-%dT%H:%M:%S.%f%z")
 
@@ -201,8 +237,8 @@ class PatreonExtractor(Extractor):
         return (
             "https://www.patreon.com/api/" + endpoint +
 
-            "?include=campaign,access_rules,attachments,audio,images,media,"
-            "native_video_insights,poll.choices,"
+            "?include=campaign,access_rules,attachments,attachments_media,"
+            "audio,images,media,native_video_insights,poll.choices,"
             "poll.current_user_responses.user,"
             "poll.current_user_responses.choice,"
             "poll.current_user_responses.poll,"
@@ -250,8 +286,37 @@ class PatreonExtractor(Extractor):
         return [genmap[ft] for ft in filetypes]
 
     def _extract_bootstrap(self, page):
-        return util.json_loads(text.extr(
-            page, "window.patreon.bootstrap,", "\n});") + "}")
+        try:
+            data = self._extract_nextdata(page)
+            env = data["props"]["pageProps"]["bootstrapEnvelope"]
+            return env.get("pageBootstrap") or env["bootstrap"]
+        except Exception as exc:
+            self.log.debug("%s: %s", exc.__class__.__name__, exc)
+
+        bootstrap = text.extr(
+            page, 'window.patreon = {"bootstrap":', '},"apiServer"')
+        if bootstrap:
+            return util.json_loads(bootstrap + "}")
+
+        bootstrap = text.extr(
+            page,
+            'window.patreon = wrapInProxy({"bootstrap":',
+            '},"apiServer"')
+        if bootstrap:
+            return util.json_loads(bootstrap + "}")
+
+        bootstrap = text.extr(page, "window.patreon.bootstrap,", "});")
+        if bootstrap:
+            return util.json_loads(bootstrap + "}")
+
+        data = text.extr(page, "window.patreon = {", "};\n")
+        if data:
+            try:
+                return util.json_loads("{" + data + "}")["bootstrap"]
+            except Exception:
+                pass
+
+        raise exception.StopExtraction("Unable to extract bootstrap data")
 
 
 class PatreonCreatorExtractor(PatreonExtractor):
@@ -259,61 +324,17 @@ class PatreonCreatorExtractor(PatreonExtractor):
     subcategory = "creator"
     pattern = (r"(?:https?://)?(?:www\.)?patreon\.com"
                r"/(?!(?:home|join|posts|login|signup)(?:$|[/?#]))"
-               r"([^/?#]+)(?:/posts)?/?(?:\?([^#]+))?")
-    test = (
-        ("https://www.patreon.com/koveliana", {
-            "range": "1-25",
-            "count": ">= 25",
-            "keyword": {
-                "attachments"  : list,
-                "comment_count": int,
-                "content"      : str,
-                "creator"      : dict,
-                "date"         : "type:datetime",
-                "id"           : int,
-                "images"       : list,
-                "like_count"   : int,
-                "post_type"    : str,
-                "published_at" : str,
-                "title"        : str,
-            },
-        }),
-        ("https://www.patreon.com/koveliana/posts?filters[month]=2020-3", {
-            "count": 1,
-            "keyword": {"date": "dt:2020-03-30 21:21:44"},
-        }),
-        ("https://www.patreon.com/kovelianot", {
-            "exception": exception.NotFoundError,
-        }),
-        ("https://www.patreon.com/user?u=2931440"),
-        ("https://www.patreon.com/user/posts/?u=2931440"),
-    )
-
-    def __init__(self, match):
-        PatreonExtractor.__init__(self, match)
-        self.creator, self.query = match.groups()
+               r"(?:c/)?([^/?#]+)(?:/posts)?/?(?:\?([^#]+))?")
+    example = "https://www.patreon.com/USER"
 
     def posts(self):
-        query = text.parse_query(self.query)
+        creator, query = self.groups
 
-        creator_id = query.get("u")
-        if creator_id:
-            url = "{}/user/posts?u={}".format(self.root, creator_id)
-        else:
-            url = "{}/{}/posts".format(self.root, self.creator)
-        page = self.request(url, notfound="creator").text
+        query = text.parse_query(query)
+        campaign_id = self._get_campaign_id(creator, query)
+        filters = self._get_filters(query)
 
-        try:
-            data = self._extract_bootstrap(page)
-            campaign_id = data["creator"]["data"]["id"]
-        except (KeyError, ValueError):
-            raise exception.NotFoundError("creator")
-
-        filters = "".join(
-            "&filter[{}={}".format(key[8:], text.escape(value))
-            for key, value in query.items()
-            if key.startswith("filters[")
-        )
+        self.log.debug("campaign_id: %s", campaign_id)
 
         url = self._build_url("posts", (
             "&filter[campaign_id]=" + campaign_id +
@@ -323,12 +344,45 @@ class PatreonCreatorExtractor(PatreonExtractor):
         ))
         return self._pagination(url)
 
+    def _get_campaign_id(self, creator, query):
+        if creator.startswith("id:"):
+            return creator[3:]
+
+        campaign_id = query.get("c") or query.get("campaign_id")
+        if campaign_id:
+            return campaign_id
+
+        user_id = query.get("u")
+        if user_id:
+            url = "{}/user?u={}".format(self.root, user_id)
+        else:
+            url = "{}/{}".format(self.root, creator)
+        page = self.request(url, notfound="creator").text
+
+        try:
+            data = None
+            data = self._extract_bootstrap(page)
+            return data["campaign"]["data"]["id"]
+        except (KeyError, ValueError) as exc:
+            if data:
+                self.log.debug(data)
+            raise exception.StopExtraction(
+                "Unable to extract campaign ID (%s: %s)",
+                exc.__class__.__name__, exc)
+
+    def _get_filters(self, query):
+        return "".join(
+            "&filter[{}={}".format(key[8:], text.escape(value))
+            for key, value in query.items()
+            if key.startswith("filters[")
+        )
+
 
 class PatreonUserExtractor(PatreonExtractor):
     """Extractor for media from creators supported by you"""
     subcategory = "user"
     pattern = r"(?:https?://)?(?:www\.)?patreon\.com/home$"
-    test = ("https://www.patreon.com/home",)
+    example = "https://www.patreon.com/home"
 
     def posts(self):
         url = self._build_url("stream", (
@@ -343,33 +397,20 @@ class PatreonPostExtractor(PatreonExtractor):
     """Extractor for media from a single post"""
     subcategory = "post"
     pattern = r"(?:https?://)?(?:www\.)?patreon\.com/posts/([^/?#]+)"
-    test = (
-        # postfile + attachments
-        ("https://www.patreon.com/posts/precious-metal-23563293", {
-            "count": 4,
-        }),
-        # postfile + content
-        ("https://www.patreon.com/posts/56127163", {
-            "count": 3,
-            "keyword": {"filename": r"re:^(?!1).+$"},
-        }),
-        # tags (#1539)
-        ("https://www.patreon.com/posts/free-post-12497641", {
-            "keyword": {"tags": ["AWMedia"]},
-        }),
-        ("https://www.patreon.com/posts/not-found-123", {
-            "exception": exception.NotFoundError,
-        }),
-    )
-
-    def __init__(self, match):
-        PatreonExtractor.__init__(self, match)
-        self.slug = match.group(1)
+    example = "https://www.patreon.com/posts/TITLE-12345"
 
     def posts(self):
-        url = "{}/posts/{}".format(self.root, self.slug)
+        url = "{}/posts/{}".format(self.root, self.groups[0])
         page = self.request(url, notfound="post").text
-        post = self._extract_bootstrap(page)["post"]
+        bootstrap = self._extract_bootstrap(page)
+
+        try:
+            post = bootstrap["post"]
+        except KeyError:
+            self.log.debug(bootstrap)
+            if bootstrap.get("campaignDisciplinaryStatus") == "suspended":
+                self.log.warning("Account suspended")
+            return ()
 
         included = self._transform(post["included"])
         return (self._process(post["data"], included),)

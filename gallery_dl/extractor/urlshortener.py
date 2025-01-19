@@ -15,7 +15,7 @@ class UrlshortenerExtractor(BaseExtractor):
     basecategory = "urlshortener"
 
 
-INSTANCES = {
+BASE_PATTERN = UrlshortenerExtractor.update({
     "bitly": {
         "root": "https://bit.ly",
         "pattern": r"bit\.ly",
@@ -26,38 +26,21 @@ INSTANCES = {
         "root": "https://t.co",
         "pattern": r"t\.co",
     },
-}
-
-BASE_PATTERN = UrlshortenerExtractor.update(INSTANCES)
+})
 
 
 class UrlshortenerLinkExtractor(UrlshortenerExtractor):
     """Extractor for general-purpose URL shorteners"""
     subcategory = "link"
-    pattern = BASE_PATTERN + r"/([^/?&#]+)"
-    test = (
-        ("https://bit.ly/3cWIUgq", {
-            "count": 1,
-            "pattern": "^https://gumroad.com/l/storm_b1",
-        }),
-        ("https://t.co/bCgBY8Iv5n", {
-            "count": 1,
-            "pattern": "^https://twitter.com/elonmusk/status/"
-                       "1421395561324896257/photo/1",
-        }),
-        ("https://t.co/abcdefghij", {
-            "exception": exception.NotFoundError,
-        }),
-    )
+    pattern = BASE_PATTERN + r"/([^/?#]+)"
+    example = "https://bit.ly/abcde"
 
     def __init__(self, match):
         UrlshortenerExtractor.__init__(self, match)
         self.id = match.group(match.lastindex)
 
-        try:
-            self.headers = INSTANCES[self.category]["headers"]
-        except Exception:
-            self.headers = None
+    def _init(self):
+        self.headers = self.config_instance("headers")
 
     def items(self):
         response = self.request(

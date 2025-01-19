@@ -13,32 +13,19 @@ from .. import text, exception
 class MyhentaigalleryGalleryExtractor(GalleryExtractor):
     """Extractor for image galleries from myhentaigallery.com"""
     category = "myhentaigallery"
+    root = "https://myhentaigallery.com"
     directory_fmt = ("{category}", "{gallery_id} {artist:?[/] /J, }{title}")
     pattern = (r"(?:https?://)?myhentaigallery\.com"
-               r"/gallery/(?:thumbnails|show)/(\d+)")
-    test = (
-        ("https://myhentaigallery.com/gallery/thumbnails/16247", {
-            "pattern": r"https://images.myhentaicomics\.com/imagesgallery"
-                       r"/images/[^/]+/original/\d+\.jpg",
-            "keyword": {
-                "artist"    : list,
-                "count"     : 11,
-                "gallery_id": 16247,
-                "group"     : list,
-                "parodies"  : list,
-                "tags"      : ["Giantess"],
-                "title"     : "Attack Of The 50ft Woman 1",
-            },
-        }),
-        ("https://myhentaigallery.com/gallery/show/16247/1"),
-    )
-    root = "https://myhentaigallery.com"
+               r"/g(?:allery/(?:thumbnails|show))?/(\d+)")
+    example = "https://myhentaigallery.com/g/12345"
 
     def __init__(self, match):
         self.gallery_id = match.group(1)
-        url = "{}/gallery/thumbnails/{}".format(self.root, self.gallery_id)
+        url = "{}/g/{}".format(self.root, self.gallery_id)
         GalleryExtractor.__init__(self, match, url)
-        self.session.headers["Referer"] = url
+
+    def _init(self):
+        self.session.headers["Referer"] = self.gallery_url
 
     def metadata(self, page):
         extr = text.extract_from(page)
@@ -46,7 +33,7 @@ class MyhentaigalleryGalleryExtractor(GalleryExtractor):
 
         title = extr('<div class="comic-description">\n', '</h1>').lstrip()
         if title.startswith("<h1>"):
-            title = title[len("<h1>"):]
+            title = title[4:]
 
         if not title:
             raise exception.NotFoundError("gallery")
@@ -54,10 +41,10 @@ class MyhentaigalleryGalleryExtractor(GalleryExtractor):
         return {
             "title"     : text.unescape(title),
             "gallery_id": text.parse_int(self.gallery_id),
-            "tags"      : split(extr('<div>\nCategories:', '</div>')),
-            "artist"    : split(extr('<div>\nArtists:'   , '</div>')),
-            "group"     : split(extr('<div>\nGroups:'    , '</div>')),
-            "parodies"  : split(extr('<div>\nParodies:'  , '</div>')),
+            "tags"      : split(extr("        Categories:", "</div>")),
+            "artist"    : split(extr("        Artists:"   , "</div>")),
+            "group"     : split(extr("        Groups:"    , "</div>")),
+            "parodies"  : split(extr("        Parodies:"  , "</div>")),
         }
 
     def images(self, page):

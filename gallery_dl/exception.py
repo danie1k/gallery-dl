@@ -21,6 +21,7 @@ Exception
       |    +-- FilenameFormatError
       |    +-- DirectoryFormatError
       +-- FilterError
+      +-- InputFileError
       +-- NoExtractorError
       +-- StopExtraction
       +-- TerminateExtraction
@@ -53,10 +54,16 @@ class HttpError(ExtractionError):
     default = "HTTP request failed"
     code = 4
 
-    def __init__(self, message, response=None):
-        ExtractionError.__init__(self, message)
+    def __init__(self, message="", response=None):
         self.response = response
-        self.status = response.status_code if response else 0
+        if response is None:
+            self.status = 0
+        else:
+            self.status = response.status_code
+            if not message:
+                message = "'{} {}' for '{}'".format(
+                    response.status_code, response.reason, response.url)
+        ExtractionError.__init__(self, message)
 
 
 class NotFoundError(ExtractionError):
@@ -97,6 +104,15 @@ class FilterError(GalleryDLException):
     """Error while evaluating a filter expression"""
     msgfmt = "Evaluating filter expression failed ({})"
     code = 32
+
+
+class InputFileError(GalleryDLException):
+    """Error when parsing input file"""
+    code = 32
+
+    def __init__(self, message, *args):
+        GalleryDLException.__init__(
+            self, message % args if args else message)
 
 
 class NoExtractorError(GalleryDLException):

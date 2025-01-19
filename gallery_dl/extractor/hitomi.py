@@ -21,57 +21,18 @@ class HitomiGalleryExtractor(GalleryExtractor):
     category = "hitomi"
     root = "https://hitomi.la"
     pattern = (r"(?:https?://)?hitomi\.la"
-               r"/(?:manga|doujinshi|cg|gamecg|galleries|reader)"
+               r"/(?:manga|doujinshi|cg|gamecg|imageset|galleries|reader)"
                r"/(?:[^/?#]+-)?(\d+)")
-    test = (
-        ("https://hitomi.la/galleries/867789.html", {
-            "pattern": r"https://[a-c]a\.hitomi\.la/webp/\d+/\d+"
-                       r"/[0-9a-f]{64}\.webp",
-            "keyword": "86af5371f38117a07407f11af689bdd460b09710",
-            "count": 16,
-        }),
-        # download test
-        ("https://hitomi.la/galleries/1401410.html", {
-            "range": "1",
-            "content": "d75d5a3d1302a48469016b20e53c26b714d17745",
-        }),
-        # Game CG with scenes (#321)
-        ("https://hitomi.la/galleries/733697.html", {
-            "count": 210,
-        }),
-        # fallback for galleries only available through /reader/ URLs
-        ("https://hitomi.la/galleries/1045954.html", {
-            "count": 1413,
-        }),
-        # gallery with "broken" redirect
-        ("https://hitomi.la/cg/scathacha-sama-okuchi-ecchi-1291900.html", {
-            "count": 10,
-            "options": (("format", "original"),),
-            "pattern": r"https://[a-c]b\.hitomi\.la/images/\d+/\d+"
-                       r"/[0-9a-f]{64}\.jpg",
-        }),
-        # no tags
-        ("https://hitomi.la/cg/1615823.html", {
-            "count": 22,
-            "options": (("format", "avif"),),
-            "pattern": r"https://[a-c]a\.hitomi\.la/avif/\d+/\d+"
-                       r"/[0-9a-f]{64}\.avif",
-        }),
-        ("https://hitomi.la/manga/amazon-no-hiyaku-867789.html"),
-        ("https://hitomi.la/manga/867789.html"),
-        ("https://hitomi.la/doujinshi/867789.html"),
-        ("https://hitomi.la/cg/867789.html"),
-        ("https://hitomi.la/gamecg/867789.html"),
-        ("https://hitomi.la/reader/867789.html"),
-    )
+    example = "https://hitomi.la/manga/TITLE-867789.html"
 
     def __init__(self, match):
-        gid = match.group(1)
-        url = "https://ltn.hitomi.la/galleries/{}.js".format(gid)
+        self.gid = match.group(1)
+        url = "https://ltn.hitomi.la/galleries/{}.js".format(self.gid)
         GalleryExtractor.__init__(self, match, url)
-        self.info = None
+
+    def _init(self):
         self.session.headers["Referer"] = "{}/reader/{}.html".format(
-            self.root, gid)
+            self.root, self.gid)
 
     def metadata(self, page):
         self.info = info = util.json_loads(page.partition("=")[2])
@@ -97,6 +58,7 @@ class HitomiGalleryExtractor(GalleryExtractor):
         return {
             "gallery_id": text.parse_int(info["id"]),
             "title"     : info["title"],
+            "title_jpn" : info.get("japanese_title") or "",
             "type"      : info["type"].capitalize(),
             "language"  : language,
             "lang"      : util.language_to_code(language),
@@ -127,6 +89,7 @@ class HitomiGalleryExtractor(GalleryExtractor):
                     path = ext = "webp"
             ihash = image["hash"]
             idata = text.nameext_from_url(image["name"])
+            idata["extension_original"] = idata["extension"]
             if ext:
                 idata["extension"] = ext
 
@@ -145,20 +108,10 @@ class HitomiTagExtractor(Extractor):
     category = "hitomi"
     subcategory = "tag"
     root = "https://hitomi.la"
-    pattern = (r"(?:https?://)?hitomi\.la/"
-               r"(tag|artist|group|series|type|character)/"
-               r"([^/?#]+)\.html")
-    test = (
-        ("https://hitomi.la/tag/screenshots-japanese.html", {
-            "pattern": HitomiGalleryExtractor.pattern,
-            "count": ">= 35",
-        }),
-        ("https://hitomi.la/artist/a1-all-1.html"),
-        ("https://hitomi.la/group/initial%2Dg-all-1.html"),
-        ("https://hitomi.la/series/amnesia-all-1.html"),
-        ("https://hitomi.la/type/doujinshi-all-1.html"),
-        ("https://hitomi.la/character/a2-all-1.html"),
-    )
+    pattern = (r"(?:https?://)?hitomi\.la"
+               r"/(tag|artist|group|series|type|character)"
+               r"/([^/?#]+)\.html")
+    example = "https://hitomi.la/tag/TAG-LANG.html"
 
     def __init__(self, match):
         Extractor.__init__(self, match)
@@ -169,7 +122,10 @@ class HitomiTagExtractor(Extractor):
             self.tag = tag
 
     def items(self):
-        data = {"_extractor": HitomiGalleryExtractor}
+        data = {
+            "_extractor": HitomiGalleryExtractor,
+            "search_tags": text.unquote(self.tag.rpartition("-")[0]),
+        }
         nozomi_url = "https://ltn.hitomi.la/{}/{}.nozomi".format(
             self.type, self.tag)
         headers = {
@@ -196,6 +152,107 @@ class HitomiTagExtractor(Extractor):
                     response.headers["content-range"].rpartition("/")[2])
             if offset >= total:
                 return
+
+
+class HitomiIndexExtractor(HitomiTagExtractor):
+    """Extractor for galleries from index searches on hitomi.la"""
+    subcategory = "index"
+    pattern = r"(?:https?://)?hitomi\.la/(\w+)-(\w+)\.html"
+    example = "https://hitomi.la/index-LANG.html"
+
+    def __init__(self, match):
+        Extractor.__init__(self, match)
+        self.tag, self.language = match.groups()
+
+    def items(self):
+        data = {"_extractor": HitomiGalleryExtractor}
+        nozomi_url = "https://ltn.hitomi.la/{}-{}.nozomi".format(
+            self.tag, self.language)
+        headers = {
+            "Origin": self.root,
+            "Cache-Control": "max-age=0",
+        }
+
+        offset = 0
+        total = None
+        while True:
+            headers["Referer"] = "{}/{}-{}.html?page={}".format(
+                self.root, self.tag, self.language, offset // 100 + 1)
+            headers["Range"] = "bytes={}-{}".format(offset, offset+99)
+            response = self.request(nozomi_url, headers=headers)
+
+            for gallery_id in decode_nozomi(response.content):
+                gallery_url = "{}/galleries/{}.html".format(
+                    self.root, gallery_id)
+                yield Message.Queue, gallery_url, data
+
+            offset += 100
+            if total is None:
+                total = text.parse_int(
+                    response.headers["content-range"].rpartition("/")[2])
+            if offset >= total:
+                return
+
+
+class HitomiSearchExtractor(Extractor):
+    """Extractor for galleries from multiple tag searches on hitomi.la"""
+    category = "hitomi"
+    subcategory = "search"
+    root = "https://hitomi.la"
+    pattern = r"(?:https?://)?hitomi\.la/search\.html\?([^/?#]+)"
+    example = "https://hitomi.la/search.html?QUERY"
+
+    def __init__(self, match):
+        Extractor.__init__(self, match)
+        self.query = match.group(1)
+        self.tags = text.unquote(self.query)
+
+    def items(self):
+        data = {
+            "_extractor": HitomiGalleryExtractor,
+            "search_tags": self.tags,
+        }
+        results = [self.get_nozomi_items(tag) for tag in self.tags.split(" ")]
+        intersects = set.intersection(*results)
+
+        for gallery_id in sorted(intersects, reverse=True):
+            gallery_url = "{}/galleries/{}.html".format(
+                self.root, gallery_id)
+            yield Message.Queue, gallery_url, data
+
+    def get_nozomi_items(self, full_tag):
+        area, tag, language = self.get_nozomi_args(full_tag)
+
+        if area:
+            nozomi_url = "https://ltn.hitomi.la/n/{}/{}-{}.nozomi".format(
+                area, tag, language)
+        else:
+            nozomi_url = "https://ltn.hitomi.la/n/{}-{}.nozomi".format(
+                tag, language)
+
+        headers = {
+            "Origin": self.root,
+            "Cache-Control": "max-age=0",
+            "Referer": "{}/search.html?{}".format(self.root, self.query),
+        }
+
+        response = self.request(nozomi_url, headers=headers)
+        return set(decode_nozomi(response.content))
+
+    def get_nozomi_args(self, query):
+        ns, _, tag = query.strip().partition(":")
+        area = ns
+        language = "all"
+
+        if ns == "female" or ns == "male":
+            area = "tag"
+            tag = query
+        elif ns == "language":
+            area = None
+            language = tag
+            tag = "index"
+
+        return area, tag.replace("_", " "), language
 
 
 @memcache(maxage=1800)

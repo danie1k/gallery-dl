@@ -7,58 +7,83 @@
 """Extractors for https://cyberdrop.me/"""
 
 from . import lolisafe
+from .common import Message
 from .. import text
+
+BASE_PATTERN = r"(?:https?://)?(?:www\.)?cyberdrop\.(?:me|to)"
 
 
 class CyberdropAlbumExtractor(lolisafe.LolisafeAlbumExtractor):
+    """Extractor for cyberdrop albums"""
     category = "cyberdrop"
     root = "https://cyberdrop.me"
-    pattern = r"(?:https?://)?(?:www\.)?cyberdrop\.(?:me|to)/a/([^/?#]+)"
-    test = (
-        # images
-        ("https://cyberdrop.me/a/keKRjm4t", {
-            "pattern": r"https://fs-\d+\.cyberdrop\.to/.*\.(jpg|png|webp)$",
-            "keyword": {
-                "album_id": "keKRjm4t",
-                "album_name": "Fate (SFW)",
-                "album_size": 150069254,
-                "count": 62,
-                "date": "dt:2020-06-18 13:14:20",
-                "description": "",
-                "id": r"re:\w{8}",
-            },
-        }),
-        # videos
-        ("https://cyberdrop.to/a/l8gIAXVD", {
-            "pattern": r"https://fs-\d+\.cyberdrop\.to/.*\.mp4$",
-            "count": 31,
-            "keyword": {
-                "album_id": "l8gIAXVD",
-                "album_name": "Achelois17 videos",
-                "album_size": 652037121,
-                "date": "dt:2020-06-16 15:40:44",
-            },
-        }),
-    )
+    root_api = "https://api.cyberdrop.me"
+    pattern = BASE_PATTERN + r"/a/([^/?#]+)"
+    example = "https://cyberdrop.me/a/ID"
+
+    def items(self):
+        files, data = self.fetch_album(self.album_id)
+
+        yield Message.Directory, data
+        for data["num"], file in enumerate(files, 1):
+            file.update(data)
+            text.nameext_from_url(file["name"], file)
+            file["name"], sep, file["id"] = file["filename"].rpartition("-")
+            yield Message.Url, file["url"], file
 
     def fetch_album(self, album_id):
-        url = self.root + "/a/" + self.album_id
-        extr = text.extract_from(self.request(url).text)
+        url = "{}/a/{}".format(self.root, album_id)
+        page = self.request(url).text
+        extr = text.extract_from(page)
 
-        files = []
-        append = files.append
-        while True:
-            url = text.unescape(extr('id="file" href="', '"'))
-            if not url:
-                break
-            append({"file": url,
-                    "_fallback": (self.root + url[url.find("/", 8):],)})
+        desc = extr('property="og:description" content="', '"')
+        if desc.startswith("A privacy-focused censorship-resistant file "
+                           "sharing platform free for everyone."):
+            desc = ""
+        extr('id="title"', "")
 
-        return files, {
-            "album_id"   : self.album_id,
-            "album_name" : extr("name: '", "'"),
-            "date"       : text.parse_timestamp(extr("timestamp: ", ",")),
-            "album_size" : text.parse_int(extr("totalSize: ", ",")),
-            "description": extr("description: `", "`"),
-            "count"      : len(files),
+        album = {
+            "album_id"   : album_id,
+            "album_name" : text.unescape(extr('title="', '"')),
+            "album_size" : text.parse_bytes(extr(
+                '<p class="title">', "B")),
+            "date"       : text.parse_datetime(extr(
+                '<p class="title">', '<'), "%d.%m.%Y"),
+            "description": text.unescape(text.unescape(  # double
+                desc.rpartition(" [R")[0])),
+        }
+
+        file_ids = list(text.extract_iter(page, 'id="file" href="/f/', '"'))
+        album["count"] = len(file_ids)
+        return self._extract_files(file_ids), album
+
+    def _extract_files(self, file_ids):
+        for file_id in file_ids:
+            try:
+                url = "{}/api/file/info/{}".format(self.root_api, file_id)
+                file = self.request(url).json()
+                auth = self.request(file["auth_url"]).json()
+                file["url"] = auth["url"]
+            except Exception as exc:
+                self.log.warning("%s (%s: %s)",
+                                 file_id, exc.__class__.__name__, exc)
+                continue
+
+            yield file
+
+
+class CyberdropMediaExtractor(CyberdropAlbumExtractor):
+    """Extractor for cyberdrop media links"""
+    subcategory = "media"
+    directory_fmt = ("{category}",)
+    pattern = BASE_PATTERN + r"/f/([^/?#]+)"
+    example = "https://cyberdrop.me/f/ID"
+
+    def fetch_album(self, album_id):
+        return self._extract_files((album_id,)), {
+            "album_id"   : "",
+            "album_name" : "",
+            "album_size" : -1,
+            "description": "",
+            "count"      : 1,
         }

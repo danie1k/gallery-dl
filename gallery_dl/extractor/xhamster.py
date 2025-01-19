@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2019-2020 Mike Fährmann
+# Copyright 2019-2023 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -20,8 +20,8 @@ class XhamsterExtractor(Extractor):
     category = "xhamster"
 
     def __init__(self, match):
-        Extractor.__init__(self, match)
         self.root = "https://" + match.group(1)
+        Extractor.__init__(self, match)
 
 
 class XhamsterGalleryExtractor(XhamsterExtractor):
@@ -32,59 +32,7 @@ class XhamsterGalleryExtractor(XhamsterExtractor):
     filename_fmt = "{num:>03}_{id}.{extension}"
     archive_fmt = "{id}"
     pattern = BASE_PATTERN + r"(/photos/gallery/[^/?#]+)"
-    test = (
-        ("https://xhamster.com/photos/gallery/11748968", {
-            "pattern": r"https://thumb-p\d+.xhcdn.com/./[\w/-]+_1000.jpg$",
-            "count": ">= 144",
-            "keyword": {
-                "comments": int,
-                "count": int,
-                "favorite": bool,
-                "id": int,
-                "num": int,
-                "height": int,
-                "width": int,
-                "imageURL": str,
-                "pageURL": str,
-                "thumbURL": str,
-                "gallery": {
-                    "date": "dt:2019-04-16 00:07:31",
-                    "description": "",
-                    "dislikes": int,
-                    "id": 11748968,
-                    "likes": int,
-                    "tags": ["NON-Porn"],
-                    "thumbnail": str,
-                    "title": "Make the world better.",
-                    "views": int,
-                },
-                "user": {
-                    "id": 16874672,
-                    "name": "Anonymousrants",
-                    "retired": bool,
-                    "subscribers": int,
-                    "url": "https://xhamster.com/users/anonymousrants",
-                    "verified": bool,
-                },
-            },
-        }),
-        ("https://jp.xhamster2.com/photos/gallery/11748968", {
-            "pattern": r"https://thumb-p\d+.xhcdn.com/./[\w/-]+_1000.jpg$",
-            "count": ">= 144",
-        }),
-        ("https://xhamster.com/photos/gallery/make-the-world-better-11748968"),
-        ("https://xhamster.com/photos/gallery/11748968"),
-        ("https://xhamster.one/photos/gallery/11748968"),
-        ("https://xhamster.desi/photos/gallery/11748968"),
-        ("https://xhamster2.com/photos/gallery/11748968"),
-        ("https://en.xhamster.com/photos/gallery/11748968"),
-        ("https://xhamster.porncache.net/photos/gallery/11748968"),
-    )
-
-    def __init__(self, match):
-        XhamsterExtractor.__init__(self, match)
-        self.path = match.group(2)
-        self.data = None
+    example = "https://xhamster.com/photos/gallery/12345"
 
     def items(self):
         data = self.metadata()
@@ -92,37 +40,42 @@ class XhamsterGalleryExtractor(XhamsterExtractor):
         for num, image in enumerate(self.images(), 1):
             url = image["imageURL"]
             image.update(data)
+            text.nameext_from_url(url, image)
             image["num"] = num
-            yield Message.Url, url, text.nameext_from_url(url, image)
+            image["extension"] = "webp"
+            del image["modelName"]
+            yield Message.Url, url, image
 
     def metadata(self):
-        self.data = self._data(self.root + self.path)
-        user = self.data["authorModel"]
-        imgs = self.data["photosGalleryModel"]
+        data = self.data = self._extract_data(self.root + self.groups[1])
+
+        gallery = data["galleryPage"]
+        info = gallery["infoProps"]
+        model = gallery["galleryModel"]
+        author = info["authorInfoProps"]
 
         return {
             "user":
             {
-                "id"         : text.parse_int(user["id"]),
-                "url"        : user["pageURL"],
-                "name"       : user["name"],
-                "retired"    : user["retired"],
-                "verified"   : user["verified"],
-                "subscribers": user["subscribers"],
+                "id"         : text.parse_int(model["userId"]),
+                "url"        : author["authorLink"],
+                "name"       : author["authorName"],
+                "verified"   : True if author.get("verified") else False,
+                "subscribers": info["subscribeButtonProps"]["subscribers"],
             },
             "gallery":
             {
-                "id"         : text.parse_int(imgs["id"]),
-                "tags"       : [c["name"] for c in imgs["categories"]],
-                "date"       : text.parse_timestamp(imgs["created"]),
-                "views"      : text.parse_int(imgs["views"]),
-                "likes"      : text.parse_int(imgs["rating"]["likes"]),
-                "dislikes"   : text.parse_int(imgs["rating"]["dislikes"]),
-                "title"      : text.unescape(imgs["title"]),
-                "description": text.unescape(imgs["description"]),
-                "thumbnail"  : imgs["thumbURL"],
+                "id"         : text.parse_int(gallery["id"]),
+                "tags"       : [t["label"] for t in info["categoriesTags"]],
+                "date"       : text.parse_timestamp(model["created"]),
+                "views"      : text.parse_int(model["views"]),
+                "likes"      : text.parse_int(model["rating"]["likes"]),
+                "dislikes"   : text.parse_int(model["rating"]["dislikes"]),
+                "title"      : model["title"],
+                "description": model["description"],
+                "thumbnail"  : model["thumbURL"],
             },
-            "count": text.parse_int(imgs["quantity"]),
+            "count": text.parse_int(gallery["photosCount"]),
         }
 
     def images(self):
@@ -130,17 +83,17 @@ class XhamsterGalleryExtractor(XhamsterExtractor):
         self.data = None
 
         while True:
-            for image in data["photosGalleryModel"]["photos"]:
-                del image["modelName"]
-                yield image
+            yield from data["photosGalleryModel"]["photos"]
 
-            pgntn = data["pagination"]
-            if pgntn["active"] == pgntn["maxPage"]:
+            pagination = data["galleryPage"]["paginationProps"]
+            if pagination["currentPageNumber"] >= pagination["lastPageNumber"]:
                 return
-            url = pgntn["pageLinkTemplate"][:-3] + str(pgntn["next"])
-            data = self._data(url)
+            url = (pagination["pageLinkTemplate"][:-3] +
+                   str(pagination["currentPageNumber"] + 1))
 
-    def _data(self, url):
+            data = self._extract_data(url)
+
+    def _extract_data(self, url):
         page = self.request(url).text
         return util.json_loads(text.extr(
             page, "window.initials=", "</script>").rstrip("\n\r;"))
@@ -150,21 +103,10 @@ class XhamsterUserExtractor(XhamsterExtractor):
     """Extractor for all galleries of an xhamster user"""
     subcategory = "user"
     pattern = BASE_PATTERN + r"/users/([^/?#]+)(?:/photos)?/?(?:$|[?#])"
-    test = (
-        ("https://xhamster.com/users/goldenpalomino/photos", {
-            "pattern": XhamsterGalleryExtractor.pattern,
-            "count": 50,
-            "range": "1-50",
-        }),
-        ("https://xhamster.com/users/nickname68"),
-    )
-
-    def __init__(self, match):
-        XhamsterExtractor.__init__(self, match)
-        self.user = match.group(2)
+    example = "https://xhamster.com/users/USER/photos"
 
     def items(self):
-        url = "{}/users/{}/photos".format(self.root, self.user)
+        url = "{}/users/{}/photos".format(self.root, self.groups[1])
         data = {"_extractor": XhamsterGalleryExtractor}
 
         while url:

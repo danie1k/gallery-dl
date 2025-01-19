@@ -90,21 +90,94 @@ def initialize():
     return 0
 
 
-def load(files=None, strict=False, load=util.json_loads):
+def open_extern():
+    for path in _default_configs:
+        path = util.expand_path(path)
+        if os.access(path, os.R_OK | os.W_OK):
+            break
+    else:
+        log.warning("Unable to find any writable configuration file")
+        return 1
+
+    if util.WINDOWS:
+        openers = ("explorer", "notepad")
+    else:
+        openers = ("xdg-open", "open")
+        editor = os.environ.get("EDITOR")
+        if editor:
+            openers = (editor,) + openers
+
+    import shutil
+    for opener in openers:
+        opener = shutil.which(opener)
+        if opener:
+            break
+    else:
+        log.warning("Unable to find a program to open '%s' with", path)
+        return 1
+
+    log.info("Running '%s %s'", opener, path)
+    retcode = util.Popen((opener, path)).wait()
+
+    if not retcode:
+        try:
+            with open(path, encoding="utf-8") as fp:
+                util.json_loads(fp.read())
+        except Exception as exc:
+            log.warning("%s when parsing '%s': %s",
+                        exc.__class__.__name__, path, exc)
+            return 2
+
+    return retcode
+
+
+def status():
+    from .output import stdout_write
+
+    paths = []
+    for path in _default_configs:
+        path = util.expand_path(path)
+
+        try:
+            with open(path, encoding="utf-8") as fp:
+                util.json_loads(fp.read())
+        except FileNotFoundError:
+            status = "Not Present"
+        except OSError:
+            status = "Inaccessible"
+        except ValueError:
+            status = "Invalid JSON"
+        except Exception as exc:
+            log.debug(exc)
+            status = "Unknown"
+        else:
+            status = "OK"
+
+        paths.append((path, status))
+
+    fmt = "{{:<{}}} : {{}}\n".format(
+        max(len(p[0]) for p in paths)).format
+
+    for path, status in paths:
+        stdout_write(fmt(path, status))
+
+
+def load(files=None, strict=False, loads=util.json_loads):
     """Load JSON configuration files"""
     for pathfmt in files or _default_configs:
         path = util.expand_path(pathfmt)
         try:
-            with open(path, encoding="utf-8") as file:
-                conf = load(file.read())
+            with open(path, encoding="utf-8") as fp:
+                conf = loads(fp.read())
         except OSError as exc:
             if strict:
                 log.error(exc)
-                sys.exit(1)
+                raise SystemExit(1)
         except Exception as exc:
-            log.warning("Could not parse '%s': %s", path, exc)
+            log.error("%s when loading '%s': %s",
+                      exc.__class__.__name__, path, exc)
             if strict:
-                sys.exit(2)
+                raise SystemExit(2)
         else:
             if not _config:
                 _config.update(conf)
@@ -112,13 +185,20 @@ def load(files=None, strict=False, load=util.json_loads):
                 util.combine_dict(_config, conf)
             _files.append(pathfmt)
 
+            if "subconfigs" in conf:
+                subconfigs = conf["subconfigs"]
+                if subconfigs:
+                    if isinstance(subconfigs, str):
+                        subconfigs = (subconfigs,)
+                    load(subconfigs, strict, loads)
+
 
 def clear():
     """Reset configuration to an empty state"""
     _config.clear()
 
 
-def get(path, key, default=None, *, conf=_config):
+def get(path, key, default=None, conf=_config):
     """Get the value of property 'key' or a default value"""
     try:
         for p in path:
@@ -128,7 +208,7 @@ def get(path, key, default=None, *, conf=_config):
         return default
 
 
-def interpolate(path, key, default=None, *, conf=_config):
+def interpolate(path, key, default=None, conf=_config):
     """Interpolate the value of 'key'"""
     if key in conf:
         return conf[key]
@@ -142,7 +222,7 @@ def interpolate(path, key, default=None, *, conf=_config):
     return default
 
 
-def interpolate_common(common, paths, key, default=None, *, conf=_config):
+def interpolate_common(common, paths, key, default=None, conf=_config):
     """Interpolate the value of 'key'
     using multiple 'paths' along a 'common' ancestor
     """
@@ -174,26 +254,32 @@ def interpolate_common(common, paths, key, default=None, *, conf=_config):
     return default
 
 
-def accumulate(path, key, *, conf=_config):
+def accumulate(path, key, conf=_config):
     """Accumulate the values of 'key' along 'path'"""
     result = []
     try:
         if key in conf:
             value = conf[key]
             if value:
-                result.extend(value)
+                if isinstance(value, list):
+                    result.extend(value)
+                else:
+                    result.append(value)
         for p in path:
             conf = conf[p]
             if key in conf:
                 value = conf[key]
                 if value:
-                    result[:0] = value
+                    if isinstance(value, list):
+                        result[:0] = value
+                    else:
+                        result.insert(0, value)
     except Exception:
         pass
     return result
 
 
-def set(path, key, value, *, conf=_config):
+def set(path, key, value, conf=_config):
     """Set the value of property 'key' for this session"""
     for p in path:
         try:
@@ -203,7 +289,7 @@ def set(path, key, value, *, conf=_config):
     conf[key] = value
 
 
-def setdefault(path, key, value, *, conf=_config):
+def setdefault(path, key, value, conf=_config):
     """Set the value of property 'key' if it doesn't exist"""
     for p in path:
         try:
@@ -213,7 +299,7 @@ def setdefault(path, key, value, *, conf=_config):
     return conf.setdefault(key, value)
 
 
-def unset(path, key, *, conf=_config):
+def unset(path, key, conf=_config):
     """Unset the value of property 'key'"""
     try:
         for p in path:
@@ -235,7 +321,7 @@ class apply():
             self.original.append((path, key, get(path, key, util.SENTINEL)))
             set(path, key, value)
 
-    def __exit__(self, etype, value, traceback):
+    def __exit__(self, exc_type, exc_value, traceback):
         for path, key, value in self.original:
             if value is util.SENTINEL:
                 unset(path, key)

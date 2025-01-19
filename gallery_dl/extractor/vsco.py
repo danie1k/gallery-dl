@@ -11,8 +11,8 @@
 from .common import Extractor, Message
 from .. import text, util
 
-
-BASE_PATTERN = r"(?:https?://)?(?:www\.)?vsco\.co/([^/]+)"
+BASE_PATTERN = r"(?:https?://)?(?:www\.)?vsco\.co"
+USER_PATTERN = BASE_PATTERN + r"/([^/?#]+)"
 
 
 class VscoExtractor(Extractor):
@@ -46,6 +46,8 @@ class VscoExtractor(Extractor):
                     url = "https://image-{}.vsco.co/{}".format(cdn, path)
                 elif cdn.isdecimal():
                     url = "https://image.vsco.co/" + base
+                elif img["responsive_url"].startswith("http"):
+                    url = img["responsive_url"]
                 else:
                     url = "https://" + img["responsive_url"]
 
@@ -113,19 +115,29 @@ class VscoExtractor(Extractor):
 
 
 class VscoUserExtractor(VscoExtractor):
-    """Extractor for images from a user on vsco.co"""
+    """Extractor for a vsco user profile"""
     subcategory = "user"
-    pattern = BASE_PATTERN + r"(?:/gallery|/images(?:/\d+)?)?/?(?:$|[?#])"
-    test = (
-        ("https://vsco.co/missuri/gallery", {
-            "pattern": r"https://image(-aws.+)?\.vsco\.co"
-                       r"/[0-9a-f/]+/[\w-]+\.\w+",
-            "range": "1-80",
-            "count": 80,
-        }),
-        ("https://vsco.co/missuri/images/1"),
-        ("https://vsco.co/missuri"),
-    )
+    pattern = USER_PATTERN + r"/?$"
+    example = "https://vsco.co/USER"
+
+    def initialize(self):
+        pass
+
+    def items(self):
+        base = "{}/{}/".format(self.root, self.user)
+        return self._dispatch_extractors((
+            (VscoAvatarExtractor    , base + "avatar"),
+            (VscoGalleryExtractor   , base + "gallery"),
+            (VscoSpacesExtractor    , base + "spaces"),
+            (VscoCollectionExtractor, base + "collection"),
+        ), ("gallery",))
+
+
+class VscoGalleryExtractor(VscoExtractor):
+    """Extractor for a vsco user's gallery"""
+    subcategory = "gallery"
+    pattern = USER_PATTERN + r"/(?:gallery|images)"
+    example = "https://vsco.co/USER/gallery"
 
     def images(self):
         url = "{}/{}/gallery".format(self.root, self.user)
@@ -148,12 +160,8 @@ class VscoCollectionExtractor(VscoExtractor):
     subcategory = "collection"
     directory_fmt = ("{category}", "{user}", "collection")
     archive_fmt = "c_{user}_{id}"
-    pattern = BASE_PATTERN + r"/collection/"
-    test = ("https://vsco.co/vsco/collection/1", {
-        "pattern": r"https://image(-aws.+)?\.vsco\.co/[0-9a-f/]+/[\w-]+\.\w+",
-        "range": "1-80",
-        "count": 80,
-    })
+    pattern = USER_PATTERN + r"/collection"
+    example = "https://vsco.co/USER/collection/1"
 
     def images(self):
         url = "{}/{}/collection/1".format(self.root, self.user)
@@ -172,33 +180,118 @@ class VscoCollectionExtractor(VscoExtractor):
         ))
 
 
+class VscoSpaceExtractor(VscoExtractor):
+    """Extractor for a vsco.co space"""
+    subcategory = "space"
+    directory_fmt = ("{category}", "space", "{user}")
+    archive_fmt = "s_{user}_{id}"
+    pattern = BASE_PATTERN + r"/spaces/([^/?#]+)"
+    example = "https://vsco.co/spaces/a1b2c3d4e5f"
+
+    def images(self):
+        url = "{}/spaces/{}".format(self.root, self.user)
+        data = self._extract_preload_state(url)
+
+        tkn = data["users"]["currentUser"]["tkn"]
+        sid = self.user
+
+        posts = data["entities"]["posts"]
+        images = data["entities"]["postImages"]
+        for post in posts.values():
+            post["image"] = images[post["image"]]
+
+        space = data["spaces"]["byId"][sid]
+        space["postsList"] = [posts[pid] for pid in space["postsList"]]
+
+        url = "{}/grpc/spaces/{}/posts".format(self.root, sid)
+        params = {}
+        return self._pagination(url, params, tkn, space)
+
+    def _pagination(self, url, params, token, data):
+        headers = {
+            "Accept"       : "application/json",
+            "Referer"      : "{}/spaces/{}".format(self.root, self.user),
+            "Content-Type" : "application/json",
+            "Authorization": "Bearer " + token,
+        }
+
+        while True:
+            for post in data["postsList"]:
+                post = self._transform_media(post["image"])
+                post["upload_date"] = post["upload_date"]["sec"] * 1000
+                yield post
+
+            cursor = data["cursor"]
+            if cursor.get("atEnd"):
+                return
+            params["cursor"] = cursor["postcursorcontext"]["postId"]
+
+            data = self.request(url, params=params, headers=headers).json()
+
+
+class VscoSpacesExtractor(VscoExtractor):
+    """Extractor for a vsco.co user's spaces"""
+    subcategory = "spaces"
+    pattern = USER_PATTERN + r"/spaces"
+    example = "https://vsco.co/USER/spaces"
+
+    def items(self):
+        url = "{}/{}/spaces".format(self.root, self.user)
+        data = self._extract_preload_state(url)
+
+        tkn = data["users"]["currentUser"]["tkn"]
+        uid = data["sites"]["siteByUsername"][self.user]["site"]["userId"]
+
+        headers = {
+            "Accept"       : "application/json",
+            "Referer"      : url,
+            "Content-Type" : "application/json",
+            "Authorization": "Bearer " + tkn,
+        }
+        # this would theoretically need to be paginated
+        url = "{}/grpc/spaces/user/{}".format(self.root, uid)
+        data = self.request(url, headers=headers).json()
+
+        for space in data["spacesWithRoleList"]:
+            space = space["space"]
+            url = "{}/spaces/{}".format(self.root, space["id"])
+            space["_extractor"] = VscoSpaceExtractor
+            yield Message.Queue, url, space
+
+
+class VscoAvatarExtractor(VscoExtractor):
+    """Extractor for vsco.co user avatars"""
+    subcategory = "avatar"
+    pattern = USER_PATTERN + r"/avatar"
+    example = "https://vsco.co/USER/avatar"
+
+    def images(self):
+        url = "{}/{}/gallery".format(self.root, self.user)
+        page = self.request(url).text
+        piid = text.extr(page, '"profileImageId":"', '"')
+
+        url = "https://im.vsco.co/" + piid
+        # needs GET request, since HEAD does not redirect to full URL
+        response = self.request(url, allow_redirects=False)
+
+        return ({
+            "_id"           : piid,
+            "is_video"      : False,
+            "grid_name"     : "",
+            "upload_date"   : 0,
+            "responsive_url": response.headers["Location"],
+            "video_url"     : "",
+            "image_meta"    : None,
+            "width"         : 0,
+            "height"        : 0,
+        },)
+
+
 class VscoImageExtractor(VscoExtractor):
     """Extractor for individual images on vsco.co"""
     subcategory = "image"
-    pattern = BASE_PATTERN + r"/media/([0-9a-fA-F]+)"
-    test = (
-        ("https://vsco.co/erenyildiz/media/5d34b93ef632433030707ce2", {
-            "url": "a45f9712325b42742324b330c348b72477996031",
-            "content": "1394d070828d82078035f19a92f404557b56b83f",
-            "keyword": {
-                "id"    : "5d34b93ef632433030707ce2",
-                "user"  : "erenyildiz",
-                "grid"  : "erenyildiz",
-                "meta"  : dict,
-                "tags"  : list,
-                "date"  : "dt:2019-07-21 19:12:11",
-                "video" : False,
-                "width" : 1537,
-                "height": 1537,
-                "description": "re:Ni seviyorum. #vsco #vscox #vscochallenges",
-            },
-        }),
-        ("https://vsco.co/jimenalazof/media/5b4feec558f6c45c18c040fd", {
-            "url": "08e7eef3301756ce81206c0b47c1e9373756a74a",
-            "content": "e739f058d726ee42c51c180a505747972a7dfa47",
-            "keyword": {"video" : True},
-        }),
-    )
+    pattern = USER_PATTERN + r"/media/([0-9a-fA-F]+)"
+    example = "https://vsco.co/USER/media/0123456789abcdef"
 
     def __init__(self, match):
         VscoExtractor.__init__(self, match)
